@@ -42,21 +42,6 @@ interface and behaviour settle. Releases carry stability suffixes:
 Use `drea --version` (or `drea -v`) to see the version of the binary you are
 running.
 
-## Versioning
-
-drea follows [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
-The leading `v0.x` line is pre-stable: anything may still change while the
-interface and behaviour settle. Releases carry stability suffixes:
-
-- `v0.1.0-alpha.N` — early preview releases. The current release is
-  **`v0.1.0-alpha.1`**.
-- `-beta.N` — feature-complete previews for wider testing.
-- `-rc.N` — release candidates.
-- `v0.1.0` — first stable-enough minor release.
-
-Use `drea --version` (or `drea -v`) to see the version of the binary you are
-running.
-
 ## Build
 
 Requires Go 1.19+ (builds with the Go version shipped in Debian 12).
