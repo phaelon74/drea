@@ -100,6 +100,9 @@ func (u *UI) ShowStatus() {
 }
 
 func (u *UI) showStatusLocked() {
+	// Never redraw over a mid-line assistant chunk: \r\033[K would erase it.
+	u.ensureLineStartLocked()
+
 	used, total, wd, msg := u.statusUsed, u.statusTotal, u.statusWorkdir, u.statusMsg
 	u.statusShown = true
 
@@ -160,6 +163,9 @@ func (u *UI) HideStatus() {
 }
 
 func (u *UI) hideStatusLocked() {
+	// Same as showStatusLocked: clearing the current row must not wipe
+	// streamed assistant text that has not ended with a newline yet.
+	u.ensureLineStartLocked()
 	u.statusShown = false
 	fmt.Fprint(u.out, "\r\033[K")
 	u.lineStart = true

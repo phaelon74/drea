@@ -177,6 +177,9 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		})
 		live.close()
 		a.ui.StopThinking()
+		// Finish the assistant line before redrawing the status bar; otherwise
+		// a mid-line \r redraw erases the answer the model just streamed.
+		ensureNL()
 		if res != nil {
 			if res.Usage.PromptTokens > 0 {
 				a.lastPromptTokens = res.Usage.PromptTokens
@@ -187,7 +190,6 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		if err != nil {
 			return err
 		}
-		ensureNL()
 
 		// Record the assistant turn (content and/or tool calls).
 		// Keep the recorded message in sync with any post-processing below

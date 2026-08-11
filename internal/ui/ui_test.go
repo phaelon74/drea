@@ -205,6 +205,26 @@ func TestReadInputPastedCode(t *testing.T) {
 	}
 }
 
+func TestStatusBarDoesNotWipeMidLineAssistantText(t *testing.T) {
+	var buf bytes.Buffer
+	u := &UI{out: &buf, colour: false, tty: true, lineStart: true}
+	u.AssistantHeader()
+	u.Assistant("Paris") // no trailing newline — the common short-answer case
+	u.SetStatus(10, 100)
+	u.ShowStatus()
+	u.HideStatus()
+	got := buf.String()
+	if !strings.Contains(got, "Paris") {
+		t.Fatalf("status redraw erased mid-line assistant text: %q", got)
+	}
+	// The answer must appear before any status-bar clear/redraw escapes.
+	paris := strings.Index(got, "Paris")
+	clear := strings.Index(got, "\r\033[K")
+	if clear >= 0 && clear < paris {
+		t.Fatalf("status clear happened before assistant text: %q", got)
+	}
+}
+
 func TestTermWidthFallback(t *testing.T) {
 	// In the test harness stdout is not a terminal, so termWidth must fall
 	// back to a sane default rather than 0.
