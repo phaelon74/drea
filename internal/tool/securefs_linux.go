@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -215,6 +216,10 @@ const (
 )
 
 func renameat2(oldDir int, oldName string, newDir int, newName string, flags uintptr) error {
+	sysnum := sysRenameat2()
+	if sysnum == 0 {
+		return syscall.ENOSYS
+	}
 	oldPtr, err := syscall.BytePtrFromString(oldName)
 	if err != nil {
 		return err
@@ -223,9 +228,32 @@ func renameat2(oldDir int, oldName string, newDir int, newName string, flags uin
 	if err != nil {
 		return err
 	}
-	_, _, errno := syscall.Syscall6(syscall.SYS_RENAMEAT2, uintptr(oldDir), uintptr(unsafe.Pointer(oldPtr)), uintptr(newDir), uintptr(unsafe.Pointer(newPtr)), flags, 0)
+	_, _, errno := syscall.Syscall6(sysnum, uintptr(oldDir), uintptr(unsafe.Pointer(oldPtr)), uintptr(newDir), uintptr(unsafe.Pointer(newPtr)), flags, 0)
 	if errno != 0 {
 		return errno
 	}
 	return nil
+}
+
+// sysRenameat2 returns the Linux renameat2 syscall number. The frozen syscall
+// package omits SYS_RENAMEAT2 on some GOARCHes, so we keep the numbers here.
+func sysRenameat2() uintptr {
+	switch runtime.GOARCH {
+	case "amd64", "s390x":
+		return 316
+	case "arm64", "riscv64", "loong64":
+		return 276
+	case "386":
+		return 353
+	case "arm":
+		return 382
+	case "ppc64", "ppc64le":
+		return 357
+	case "mips", "mipsle":
+		return 4351
+	case "mips64", "mips64le":
+		return 5515
+	default:
+		return 0
+	}
 }
