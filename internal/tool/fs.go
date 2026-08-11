@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,12 +13,17 @@ import (
 	"github.com/dreaagent/drea/internal/patch"
 )
 
+// maxFileBytes caps a single read_file / write_file payload so a hostile or
+// accidental huge file cannot exhaust memory.
+const maxFileBytes = 2 << 20 // 2 MiB
+
 // ---- read_file ----
 
 type readFile struct{ root string }
 
 func (t *readFile) Name() string   { return "read_file" }
-func (t *readFile) Mutating() bool { return false }
+func (t *readFile) Mutating() bool      { return false }
+func (t *readFile) AlwaysConfirm() bool { return false }
 func (t *readFile) Description() string {
 	return "Read a UTF-8 text file within the workspace. Optionally start at a 1-based line offset and limit the number of lines returned. Output is prefixed with line numbers."
 }
@@ -52,9 +58,17 @@ func (t *readFile) Run(_ context.Context, args json.RawMessage) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(p)
+	f, _, _, err := openSecureRegular(t.root, p)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", rel(t.root, p), err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxFileBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(data) > maxFileBytes {
+		return "", fmt.Errorf("%s exceeds the %d byte read limit", rel(t.root, p), maxFileBytes)
 	}
 	lines := strings.Split(string(data), "\n")
 	start := 0
@@ -83,7 +97,8 @@ func (t *readFile) Run(_ context.Context, args json.RawMessage) (string, error) 
 type writeFile struct{ root string }
 
 func (t *writeFile) Name() string   { return "write_file" }
-func (t *writeFile) Mutating() bool { return true }
+func (t *writeFile) Mutating() bool      { return true }
+func (t *writeFile) AlwaysConfirm() bool { return false }
 func (t *writeFile) Description() string {
 	return "Create a new file or overwrite an existing one with the given content. Parent directories are created automatically."
 }
@@ -113,17 +128,59 @@ func (t *writeFile) Run(_ context.Context, args json.RawMessage) (string, error)
 	if err := decode(args, &a); err != nil {
 		return "", err
 	}
+	if len(a.Content) > maxFileBytes {
+		return "", fmt.Errorf("content exceeds the %d byte write limit", maxFileBytes)
+	}
 	p, err := resolve(t.root, a.Path)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return "", err
+	mode, expected, err := inspectSecureTarget(t.root, p)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", rel(t.root, p), err)
 	}
-	if err := os.WriteFile(p, []byte(a.Content), 0o644); err != nil {
+	if err := secureWriteAtomic(t.root, p, []byte(a.Content), mode, expected); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(a.Content), rel(t.root, p)), nil
+}
+
+// writeFileAtomic writes data to a temp file in the destination's directory
+// and renames it into place, so a crash mid-write cannot leave a half-written
+// target. mode is applied to the temp file before the rename.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".drea-write-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // ---- edit_file ----
@@ -131,7 +188,8 @@ func (t *writeFile) Run(_ context.Context, args json.RawMessage) (string, error)
 type editFile struct{ root string }
 
 func (t *editFile) Name() string   { return "edit_file" }
-func (t *editFile) Mutating() bool { return true }
+func (t *editFile) Mutating() bool      { return true }
+func (t *editFile) AlwaysConfirm() bool { return false }
 func (t *editFile) Description() string {
 	return "Replace a string in a file. By default old_string must match exactly once; set replace_all to replace every occurrence. Use enough surrounding context to make old_string unique. If no exact match exists, the text is matched line-by-line ignoring leading/trailing whitespace. To change several places in one file, prefer apply_patch."
 }
@@ -169,7 +227,7 @@ func (t *editFile) Run(_ context.Context, args json.RawMessage) (string, error) 
 		return "", err
 	}
 	// A single-hunk apply_patch: one matching engine for both tools.
-	res, err := applyEdits(p, []patch.Edit{{Old: a.OldString, New: a.NewString, ReplaceAll: a.ReplaceAll}})
+	res, err := applyEdits(t.root, p, []patch.Edit{{Old: a.OldString, New: a.NewString, ReplaceAll: a.ReplaceAll}})
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", rel(t.root, p), err)
 	}
@@ -185,7 +243,8 @@ func (t *editFile) Run(_ context.Context, args json.RawMessage) (string, error) 
 type listDir struct{ root string }
 
 func (t *listDir) Name() string   { return "list_dir" }
-func (t *listDir) Mutating() bool { return false }
+func (t *listDir) Mutating() bool      { return false }
+func (t *listDir) AlwaysConfirm() bool { return false }
 func (t *listDir) Description() string {
 	return "List the immediate entries of a directory within the workspace. Directories are suffixed with '/'."
 }
@@ -221,7 +280,7 @@ func (t *listDir) Run(_ context.Context, args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	entries, err := os.ReadDir(p)
+	entries, err := readSecureDir(t.root, p)
 	if err != nil {
 		return "", err
 	}

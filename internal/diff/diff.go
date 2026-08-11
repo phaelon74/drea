@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// MaxLineProduct caps the LCS table size (len(oldLines)*len(newLines)). Above
+// this the allocation would risk OOM; callers should skip the preview.
+const MaxLineProduct = 2_000_000
+
 // Line is a single diff line tagged with its operation.
 type Line struct {
 	// Op is ' ' (context), '-' (removed) or '+' (added).
@@ -15,12 +19,24 @@ type Line struct {
 	Text string
 }
 
+// Fits reports whether a line-level LCS of old and new stays within the
+// allocation budget.
+func Fits(oldText, newText string) bool {
+	a := splitLines(oldText)
+	b := splitLines(newText)
+	return int64(len(a))*int64(len(b)) <= MaxLineProduct
+}
+
 // Lines computes a line-level diff from old to new via a longest-common-
 // subsequence backtrace. The result interleaves removals, additions and
-// context in original order.
+// context in original order. When the line-count product exceeds
+// MaxLineProduct it returns nil so callers can skip the preview.
 func Lines(oldText, newText string) []Line {
 	a := splitLines(oldText)
 	b := splitLines(newText)
+	if int64(len(a))*int64(len(b)) > MaxLineProduct {
+		return nil
+	}
 
 	// lcs[i][j] = length of the LCS of a[i:] and b[j:].
 	lcs := make([][]int, len(a)+1)
@@ -65,7 +81,12 @@ func Lines(oldText, newText string) []Line {
 
 // Stat reports how many lines were added and removed between old and new.
 func Stat(oldText, newText string) (added, removed int) {
-	for _, l := range Lines(oldText, newText) {
+	return StatLines(Lines(oldText, newText))
+}
+
+// StatLines counts additions and removals in a precomputed line diff.
+func StatLines(lines []Line) (added, removed int) {
+	for _, l := range lines {
 		switch l.Op {
 		case '+':
 			added++
@@ -80,7 +101,14 @@ func Stat(oldText, newText string) (added, removed int) {
 // context lines near a change are shown. context is the number of unchanged
 // lines to keep around each change.
 func Unified(oldText, newText string, context int) string {
-	lines := Lines(oldText, newText)
+	return UnifiedLines(Lines(oldText, newText), context)
+}
+
+// UnifiedLines renders a precomputed line diff with collapsed context.
+func UnifiedLines(lines []Line, context int) string {
+	if lines == nil {
+		return ""
+	}
 	keep := visible(lines, context)
 
 	var b strings.Builder

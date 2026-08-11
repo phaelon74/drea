@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Verify (Go 1.19, Linux)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a89b9 # v5.0.0
+        with:
+          go-version: '1.19'
+      - name: verify
+        run: make verify
+
+  static-build:
+    name: Static binary (CGO_ENABLED=0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a89b9 # v5.0.0
+        with:
+          go-version: '1.19'
+      - name: build static
+        run: CGO_ENABLED=0 go build -o drea ./cmd/drea
+      - name: verify static
+        run: file drea | grep -q 'statically linked'

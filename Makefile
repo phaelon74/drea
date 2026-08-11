@@ -1,4 +1,4 @@
-.PHONY: build test vet fmt install clean
+.PHONY: build test vet fmt install clean verify
 
 BIN := drea
 
@@ -19,3 +19,10 @@ install:
 
 clean:
 	rm -f $(BIN)
+
+verify:
+	@test -z "$$(gofmt -l .)" || { echo "gofmt: unformatted files:"; gofmt -l .; exit 1; }
+	go vet ./...
+	go test ./...
+	go test -race ./...
+	go build ./...

@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,7 +33,7 @@ func TestConsumeAccumulatesToolCalls(t *testing.T) {
 
 	c := &Client{}
 	var streamed strings.Builder
-	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }})
+	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +176,7 @@ func TestJSONModeContentAsToolCalls(t *testing.T) {
 	}, "\n\n")
 
 	c := &Client{jsonMode: true}
-	res, err := c.consume(strings.NewReader(sse), Handlers{})
+	res, err := c.consume(strings.NewReader(sse), Handlers{}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +203,7 @@ func TestJSONModeReplyArray(t *testing.T) {
 
 	var streamed strings.Builder
 	c := &Client{jsonMode: true}
-	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }})
+	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +232,7 @@ func TestJSONModeReplyArrayNotDeliveredTwice(t *testing.T) {
 
 	var count int
 	c := &Client{jsonMode: true}
-	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(string) { count++ }})
+	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(string) { count++ }}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,11 +244,9 @@ func TestJSONModeReplyArrayNotDeliveredTwice(t *testing.T) {
 	}
 }
 
-// TestJSONModeEmptyArrayIsNotToolCalls verifies that an empty JSON array is
-// treated as ordinary prose (or at least not parsed as zero tool calls that
-// would leave the assistant message empty). With minItems:1 in the schema the
-// endpoint should reject this, but the client also defends against it.
-func TestJSONModeEmptyArrayIsNotToolCalls(t *testing.T) {
+// TestJSONModeEmptyArrayBecomesEmptyTurn verifies that an invalid empty action
+// list is withheld as an empty turn so the agent can issue its bounded nudge.
+func TestJSONModeEmptyArrayBecomesEmptyTurn(t *testing.T) {
 	sse := strings.Join([]string{
 		`data: {"choices":[{"delta":{"content":"[]"}}]}`,
 		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
@@ -253,18 +256,18 @@ func TestJSONModeEmptyArrayIsNotToolCalls(t *testing.T) {
 
 	var streamed strings.Builder
 	c := &Client{jsonMode: true}
-	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }})
+	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(res.ToolCalls) != 0 {
 		t.Errorf("got %d tool calls, want 0", len(res.ToolCalls))
 	}
-	if res.Content != "[]" {
-		t.Errorf("content = %q, want %q", res.Content, "[]")
+	if res.Content != "" {
+		t.Errorf("content = %q, want empty", res.Content)
 	}
-	if streamed.String() != "[]" {
-		t.Errorf("streamed = %q, want %q", streamed.String(), "[]")
+	if streamed.String() != "" {
+		t.Errorf("streamed = %q, want empty", streamed.String())
 	}
 }
 
@@ -281,7 +284,7 @@ func TestJSONModeEmptyReplyIsNotFinal(t *testing.T) {
 
 	var streamed strings.Builder
 	c := &Client{jsonMode: true}
-	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }})
+	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +312,7 @@ func TestJSONModeProseFallback(t *testing.T) {
 
 	c := &Client{jsonMode: true}
 	var streamed strings.Builder
-	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }})
+	res, err := c.consume(strings.NewReader(sse), Handlers{OnContent: func(s string) { streamed.WriteString(s) }}, StreamOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,8 +348,86 @@ func TestNoJSONModeOmitsResponseFormat(t *testing.T) {
 	}
 }
 
-// TestTopPForwarded verifies that top_p is always forwarded.
-func TestTopPForwarded(t *testing.T) {
+func TestDebugLogIsPrivateAndNeverContainsAuthorization(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, okStream)
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "traffic.log")
+	c := NewClient(srv.URL, "sk-do-not-log", "m", 0, 5*time.Second, false, "")
+	if err := c.SetDebug(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Stream(context.Background(), []Message{{Role: RoleUser, Content: "hi"}}, nil, Handlers{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "sk-do-not-log") || strings.Contains(strings.ToLower(text), "authorization") {
+		t.Fatalf("debug log contains authentication material: %q", text)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("debug mode = %o, want 600", info.Mode().Perm())
+		}
+	}
+}
+
+func TestDebugLogRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.log")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	c := NewClient("http://127.0.0.1", "", "m", 0, time.Second, false, "")
+	if err := c.SetDebug(link); err == nil {
+		t.Fatal("expected debug symlink rejection")
+	}
+}
+
+// TestDisableResponseFormatOmitsSchemaEvenInJSONMode verifies compaction-style
+// requests can disable response_format without mutating the client's JSON mode.
+func TestDisableResponseFormatOmitsSchemaEvenInJSONMode(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, okStream)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "m", 0, 5*time.Second, true, "json_schema")
+	if _, err := c.StreamWithOptions(context.Background(), []Message{{Role: RoleUser, Content: "summarize"}}, nil, Handlers{}, StreamOpts{
+		DisableResponseFormat: true,
+		DisableJSONModeParse:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "response_format") {
+		t.Fatalf("compaction request should omit response_format: %s", got)
+	}
+	if !c.JSONMode() {
+		t.Fatal("client JSON mode should remain enabled")
+	}
+}
+
+// TestTopPOmittedWhenZero verifies that top_p is omitted when unset so the
+// endpoint default applies, and forwarded when explicitly set.
+func TestTopPOmittedWhenZero(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -360,8 +441,17 @@ func TestTopPForwarded(t *testing.T) {
 	if _, err := c.Stream(context.Background(), []Message{{Role: RoleUser, Content: "hi"}}, nil, Handlers{}); err != nil {
 		t.Fatal(err)
 	}
+	if strings.Contains(got, `"top_p"`) {
+		t.Fatalf("request body should omit top_p when zero: %s", got)
+	}
+
+	got = ""
+	c = NewClientWithReasoning(srv.URL, "", "m", 0, 0.95, "", 5*time.Second, false, "")
+	if _, err := c.Stream(context.Background(), []Message{{Role: RoleUser, Content: "hi"}}, nil, Handlers{}); err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(got, `"top_p":0.95`) {
-		t.Fatalf("request body missing default top_p: %s", got)
+		t.Fatalf("request body missing explicit top_p: %s", got)
 	}
 }
 
@@ -436,6 +526,9 @@ func TestStreamRetriesThenSucceeds(t *testing.T) {
 	if content != 1 {
 		t.Errorf("OnContent called %d times, want 1 (no double delivery)", content)
 	}
+	if res.Attempts != 2 {
+		t.Errorf("Attempts = %d, want 2 (initial + retry)", res.Attempts)
+	}
 }
 
 // TestStreamHonorsRetryAfter checks the Retry-After header sets the delay.
@@ -478,13 +571,16 @@ func TestStreamRetryExhaustion(t *testing.T) {
 
 	c := testClient(srv.URL)
 	c.maxRetries = 2
-	_, err := c.Stream(context.Background(),
+	res, err := c.Stream(context.Background(),
 		[]Message{{Role: RoleUser, Content: "hi"}}, nil, Handlers{})
 	if err == nil || !strings.Contains(err.Error(), "giving up after 3 attempts") {
 		t.Fatalf("expected exhaustion error, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "503") {
 		t.Errorf("error should carry last status, got %v", err)
+	}
+	if res == nil || res.Attempts != 3 {
+		t.Fatalf("Attempts = %v, want 3", res)
 	}
 }
 
@@ -497,7 +593,7 @@ func TestStreamNoRetryOn400(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := testClient(srv.URL).Stream(context.Background(),
+	res, err := testClient(srv.URL).Stream(context.Background(),
 		[]Message{{Role: RoleUser, Content: "hi"}}, nil, Handlers{})
 	if err == nil || !strings.Contains(err.Error(), "400") {
 		t.Fatalf("expected 400 error, got %v", err)
@@ -507,6 +603,9 @@ func TestStreamNoRetryOn400(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("server calls = %d, want 1 (no retry on 400)", got)
+	}
+	if res == nil || res.Attempts != 1 {
+		t.Fatalf("Attempts = %v, want 1", res)
 	}
 }
 
@@ -564,5 +663,197 @@ func TestRetriableStatus(t *testing.T) {
 		if retriableStatus(code) {
 			t.Errorf("%d should not be retriable", code)
 		}
+	}
+}
+
+func TestBackoffInjectedSourceIsDeterministicAndConcurrentSafe(t *testing.T) {
+	newTestClient := func() *Client {
+		c := newClientWithSource("http://example.invalid", "", "m", 0, 0, "", time.Second, false, "", rand.NewSource(7))
+		c.baseDelay = time.Second
+		return c
+	}
+	a, b := newTestClient(), newTestClient()
+	for attempt := 1; attempt <= 5; attempt++ {
+		if got, want := a.backoff(attempt, 0), b.backoff(attempt, 0); got != want {
+			t.Fatalf("attempt %d: got %s, want deterministic %s", attempt, got, want)
+		}
+	}
+
+	c := newTestClient()
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d := c.backoff(1, 0)
+			if d < 500*time.Millisecond || d > time.Second {
+				t.Errorf("backoff out of range: %s", d)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestConsumeRejectsTooManyToolCalls(t *testing.T) {
+	var frames []string
+	for i := 0; i < maxStreamToolCalls+1; i++ {
+		frames = append(frames, `data: {"choices":[{"delta":{"tool_calls":[{"index":`+
+			itoa(i)+`,"id":"c","function":{"name":"t","arguments":"{}"}}]}}]}`)
+	}
+	frames = append(frames, "data: [DONE]", "")
+	c := &Client{}
+	_, err := c.consume(strings.NewReader(strings.Join(frames, "\n\n")), Handlers{}, StreamOpts{})
+	if err == nil {
+		t.Fatal("expected too many tool calls to be rejected")
+	}
+	if !strings.Contains(err.Error(), "tool call limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConsumeAggregateToolArgumentsExactLimit(t *testing.T) {
+	size := maxStreamTotalToolArgs / 4
+	var frames []string
+	for i := 0; i < 4; i++ {
+		frames = append(frames, nativeToolFrame(i, strings.Repeat("a", size)))
+	}
+	frames = append(frames, "data: [DONE]", "")
+
+	res, err := (&Client{}).consume(strings.NewReader(strings.Join(frames, "\n\n")), Handlers{}, StreamOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.ToolCalls) != 4 {
+		t.Fatalf("got %d tool calls, want 4", len(res.ToolCalls))
+	}
+}
+
+func TestConsumeRejectsAggregateToolArgumentsOverLimit(t *testing.T) {
+	size := maxStreamTotalToolArgs / 4
+	var frames []string
+	for i := 0; i < 4; i++ {
+		n := size
+		if i == 3 {
+			n++
+		}
+		frames = append(frames, nativeToolFrame(i, strings.Repeat("a", n)))
+	}
+
+	_, err := (&Client{}).consume(strings.NewReader(strings.Join(frames, "\n\n")), Handlers{}, StreamOpts{})
+	if err == nil || !strings.Contains(err.Error(), "aggregate tool call arguments") {
+		t.Fatalf("expected aggregate argument error, got %v", err)
+	}
+}
+
+func TestConsumeSSEAggregateLimit(t *testing.T) {
+	c := NewClient("http://unused", "", "m", 0, time.Second, false, "")
+	if _, err := c.consume(strings.NewReader(sseCommentBytes(maxStreamSSEBytes)), Handlers{}, StreamOpts{}); err != nil {
+		t.Fatalf("exact SSE limit rejected: %v", err)
+	}
+	if _, err := c.consume(strings.NewReader(sseCommentBytes(maxStreamSSEBytes+1)), Handlers{}, StreamOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "SSE stream exceeds") {
+		t.Fatalf("one-over SSE error = %v", err)
+	}
+}
+
+func TestConsumeContentAggregateLimit(t *testing.T) {
+	c := NewClient("http://unused", "", "m", 0, time.Second, false, "")
+	if _, err := c.consume(strings.NewReader(contentStream(maxStreamContent)), Handlers{}, StreamOpts{}); err != nil {
+		t.Fatalf("exact content limit rejected: %v", err)
+	}
+	if _, err := c.consume(strings.NewReader(contentStream(maxStreamContent+1)), Handlers{}, StreamOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "stream content exceeds") {
+		t.Fatalf("one-over content error = %v", err)
+	}
+}
+
+func sseCommentBytes(total int) string {
+	var b strings.Builder
+	b.Grow(total)
+	for total > 0 {
+		n := total
+		if n > 1024 {
+			n = 1024
+		}
+		if n == 1 {
+			b.WriteByte('\n')
+		} else {
+			b.WriteByte(':')
+			b.WriteString(strings.Repeat("x", n-2))
+			b.WriteByte('\n')
+		}
+		total -= n
+	}
+	return b.String()
+}
+
+func contentStream(total int) string {
+	var b strings.Builder
+	for total > 0 {
+		n := total
+		if n > 32*1024 {
+			n = 32 * 1024
+		}
+		b.WriteString(`data: {"choices":[{"delta":{"content":"`)
+		b.WriteString(strings.Repeat("a", n))
+		b.WriteString(`"}}]}`)
+		b.WriteString("\n\n")
+		total -= n
+	}
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+func TestConsumeAggregateToolArgumentsCountsRepeatedIndexes(t *testing.T) {
+	size := maxStreamTotalToolArgs / 4
+	var frames []string
+	for i := 0; i < 4; i++ {
+		frames = append(frames, nativeToolFrame(i, strings.Repeat("a", size)))
+	}
+	frames = append(frames, nativeToolFrame(0, "x"))
+
+	_, err := (&Client{}).consume(strings.NewReader(strings.Join(frames, "\n\n")), Handlers{}, StreamOpts{})
+	if err == nil || !strings.Contains(err.Error(), "aggregate tool call arguments") {
+		t.Fatalf("expected repeated-index aggregate error, got %v", err)
+	}
+}
+
+func nativeToolFrame(index int, args string) string {
+	return `data: {"choices":[{"delta":{"tool_calls":[{"index":` + itoa(index) +
+		`,"id":"c","type":"function","function":{"name":"t","arguments":"` + args + `"}}]}}]}`
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var d []byte
+	for i > 0 {
+		d = append([]byte{byte('0' + i%10)}, d...)
+		i /= 10
+	}
+	return string(d)
+}
+
+// TestStreamWithOptionsDisableResponseFormat verifies that StreamWithOptions
+// with DisableResponseFormat omits response_format even when the client has
+// jsonMode enabled.
+func TestStreamWithOptionsDisableResponseFormat(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, okStream)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "m", 0, 5*time.Second, true, "json_schema")
+	opts := StreamOpts{DisableResponseFormat: true}
+	if _, err := c.StreamWithOptions(context.Background(), []Message{{Role: RoleUser, Content: "hi"}}, nil, Handlers{}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "response_format") {
+		t.Fatalf("DisableResponseFormat should suppress response_format, got: %s", got)
 	}
 }

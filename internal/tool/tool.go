@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -26,6 +28,9 @@ type Tool interface {
 	// Mutating reports whether the tool changes state (writes files, runs
 	// commands) and therefore requires confirmation unless auto-approve is on.
 	Mutating() bool
+	// AlwaysConfirm reports whether this tool must prompt for approval even
+	// when auto-approve is enabled (e.g. destructive rollback).
+	AlwaysConfirm() bool
 	// Summary renders a short, human-readable description of a specific call,
 	// shown in the UI and in approval prompts.
 	Summary(args json.RawMessage) string
@@ -86,11 +91,30 @@ func (r *Registry) Specs() []llm.Tool {
 	return out
 }
 
-// ResolvePath resolves a user-supplied path against the workspace root using
-// the same confinement rules the tools enforce. It is exposed so callers (e.g.
-// the agent) can inspect a file around a mutation to render a diff.
-func (r *Registry) ResolvePath(p string) (string, error) {
-	return resolve(r.Root, p)
+// ReadFileLimited opens a workspace-relative regular file without following
+// its final component and reads at most max+1 bytes. Missing files are reported
+// with exists=false so callers can distinguish a new-file preview.
+func (r *Registry) ReadFileLimited(path string, max int) (data []byte, exists bool, err error) {
+	if max < 0 {
+		return nil, false, errors.New("negative read limit")
+	}
+	resolved, err := resolve(r.Root, path)
+	if err != nil {
+		return nil, false, err
+	}
+	f, _, _, err := openSecureRegular(r.Root, resolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	defer f.Close()
+	data, err = io.ReadAll(io.LimitReader(f, int64(max)+1))
+	if err != nil {
+		return nil, true, err
+	}
+	return data, true, nil
 }
 
 // Names returns the registered tool names, sorted.
@@ -102,16 +126,16 @@ func (r *Registry) Names() []string {
 
 // resolve joins a user-supplied path against the workspace root and verifies
 // the result stays inside it, defeating path traversal (e.g. "../../etc") and
-// symlinks that point outside the workspace.
+// symlinks that point outside the workspace. Absolute paths are rejected so
+// every tool argument is unambiguously relative to the workspace.
 func resolve(root, p string) (string, error) {
 	if strings.TrimSpace(p) == "" {
 		return "", errors.New("path is required")
 	}
-	joined := p
-	if !filepath.IsAbs(p) {
-		joined = filepath.Join(root, p)
+	if filepath.IsAbs(p) {
+		return "", fmt.Errorf("path %q must be relative to the workspace root", p)
 	}
-	clean := filepath.Clean(joined)
+	clean := filepath.Clean(filepath.Join(root, p))
 	rootClean := filepath.Clean(root)
 	if !within(rootClean, clean) {
 		return "", fmt.Errorf("path %q escapes the workspace root %q", p, root)

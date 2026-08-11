@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,10 +49,13 @@ func TestEstimateTokensCountsToolCalls(t *testing.T) {
 // endpoint that returns a summary, and asserts the system prompt and the recent
 // tail survive while the middle is replaced by a single summary message.
 func TestMaybeCompactPreservesStructure(t *testing.T) {
+	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, sse(
-			`{"choices":[{"delta":{"content":"SUMMARY-OF-OLD"}}]}`,
+			`{"choices":[{"delta":{"content":"SUMMARY-OF-OLD"}}],"usage":{"prompt_tokens":11,"completion_tokens":3}}`,
 			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
 		))
 	}))
@@ -60,7 +64,8 @@ func TestMaybeCompactPreservesStructure(t *testing.T) {
 	cfg := config.Defaults(config.Saved{})
 	cfg.Persist = false
 	cfg.ContextTokens = 1 // force compaction
-	client := llm.NewClient(srv.URL, "", "m", 0, 5*time.Second, false, "")
+	cfg.JSONMode = true
+	client := llm.NewClient(srv.URL, "", "m", 0, 5*time.Second, true, "json_schema")
 	ag := New(cfg, client, tool.NewRegistry(t.TempDir()), ui.New())
 
 	ag.messages = []llm.Message{{Role: llm.RoleSystem, Content: "SYSTEM-PROMPT"}}
@@ -82,6 +87,12 @@ func TestMaybeCompactPreservesStructure(t *testing.T) {
 	}
 	if len(ag.messages) >= 22 {
 		t.Fatalf("history not compacted: still %d messages", len(ag.messages))
+	}
+	if strings.Contains(gotBody, "response_format") {
+		t.Fatalf("compaction must omit response_format even in JSON mode: %s", gotBody)
+	}
+	if ag.Usage().PromptTokens != 11 || ag.Usage().CompletionTokens != 3 || ag.Usage().Requests < 1 {
+		t.Fatalf("compaction usage not accounted: %+v", ag.Usage())
 	}
 }
 

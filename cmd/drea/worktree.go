@@ -13,6 +13,18 @@ import (
 	"github.com/dreaagent/drea/internal/vcs"
 )
 
+var (
+	requireRepoRoot = vcs.RequireRepoRoot
+	hasCommits      = vcs.HasCommits
+	worktreeDirty   = vcs.Dirty
+	makeWorktreeDir = worktreeDir
+	addWorktree     = vcs.AddWorktree
+	worktreeChanged = func(ctx context.Context, wt vcs.Worktree) (bool, error) { return wt.Changed(ctx) }
+	removeWorktree  = func(ctx context.Context, wt vcs.Worktree) error { return wt.Remove(ctx) }
+	checkpointWork  = vcs.Checkpoint
+	mergeFFOnly     = vcs.MergeFFOnly
+)
+
 // --worktree isolates an attempt: the agent works in a scratch checkout on its
 // own branch, so a change that goes wrong cannot damage the repository it was
 // asked to improve. What happens to the result afterwards is decided by
@@ -27,32 +39,33 @@ func enterWorktree(cfg *config.Config, u *ui.UI) (vcs.Worktree, error) {
 	ctx := context.Background()
 	repo := cfg.Workdir
 
-	if !vcs.IsRepo(ctx, repo) {
-		return vcs.Worktree{}, fmt.Errorf("--worktree needs a git repository: %s is not one", repo)
+	if err := requireRepoRoot(ctx, repo); err != nil {
+		return vcs.Worktree{}, fmt.Errorf("--worktree needs a git repository root: %w", err)
 	}
-	if !vcs.HasCommits(ctx, repo) {
+	if !hasCommits(ctx, repo) {
 		return vcs.Worktree{}, fmt.Errorf("--worktree needs a commit to branch from; commit a baseline in %s first", repo)
 	}
 	// A worktree starts from HEAD, so uncommitted work is not carried over.
 	// Say so rather than letting the agent silently work from a state the user
 	// is not looking at.
-	if dirty, err := vcs.Dirty(ctx, repo); err == nil && dirty {
+	if dirty, err := worktreeDirty(ctx, repo); err == nil && dirty {
 		u.Warn("uncommitted changes in " + repo + " are not carried into the worktree (it starts from HEAD)")
 	}
 
-	dir, err := worktreeDir(repo)
+	dir, err := makeWorktreeDir(repo)
 	if err != nil {
 		return vcs.Worktree{}, err
 	}
 	branch := "drea/" + filepath.Base(dir)
 
-	wt, err := vcs.AddWorktree(ctx, repo, dir, branch)
+	wt, err := addWorktree(ctx, repo, dir, branch)
 	if err != nil {
 		return vcs.Worktree{}, fmt.Errorf("could not create worktree: %w", err)
 	}
 	cfg.Workdir = wt.Path
 	if err := cfg.Normalize(); err != nil {
-		return wt, err
+		_ = removeWorktree(ctx, wt)
+		return vcs.Worktree{}, err
 	}
 	u.Info(fmt.Sprintf("isolated in worktree %s (branch %s)", wt.Path, wt.Branch))
 	return wt, nil
@@ -82,9 +95,9 @@ func finishWorktree(wt vcs.Worktree, cfg *config.Config, objective agent.Measure
 		return
 	}
 	ctx := context.Background()
-	changed, err := wt.Changed(ctx)
+	changed, err := worktreeChanged(ctx, wt)
 	if err == nil && !changed {
-		if err := wt.Remove(ctx); err == nil {
+		if err := removeWorktree(ctx, wt); err == nil {
 			u.Info("worktree was unchanged; removed it")
 			return
 		}
@@ -113,16 +126,16 @@ func promote(ctx context.Context, wt vcs.Worktree, cfg *config.Config, objective
 		u.Warn("not promoting: the verification command is not passing")
 		return false
 	}
-	if _, _, err := vcs.Checkpoint(ctx, wt.Path, "drea: work from "+wt.Branch); err != nil {
+	if _, _, err := checkpointWork(ctx, wt.Path, "drea: work from "+wt.Branch); err != nil {
 		u.Warn("not promoting: could not commit the work: " + err.Error())
 		return false
 	}
-	if err := vcs.MergeFFOnly(ctx, wt.Repo, wt.Branch); err != nil {
+	if err := mergeFFOnly(ctx, wt.Repo, wt.Branch); err != nil {
 		u.Warn("not promoting: " + err.Error())
 		return false
 	}
 	u.Info("verification passed; fast-forwarded " + wt.Repo + " to " + wt.Branch)
-	if err := wt.Remove(ctx); err != nil {
+	if err := removeWorktree(ctx, wt); err != nil {
 		u.Info("worktree left at " + wt.Path + " (" + err.Error() + ")")
 	}
 	return true

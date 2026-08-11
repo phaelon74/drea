@@ -56,13 +56,14 @@ func TestParseToolCallFromText(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			tc, ok := parseToolCallFromText(c.in)
+			calls, ok := parseToolCallsFromText(c.in)
 			if ok != c.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
 			}
 			if !ok {
 				return
 			}
+			tc := calls[0]
 			if tc.Function.Name != c.want {
 				t.Errorf("name = %q, want %q", tc.Function.Name, c.want)
 			}

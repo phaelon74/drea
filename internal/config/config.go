@@ -1,14 +1,15 @@
 // Package config resolves harness configuration.
 //
 // Precedence (highest first): command-line flags, environment variables, the
-// persisted settings file (non-secret preferences only; see the settings
-// package), and built-in defaults. Secrets are never read from disk, keeping
-// the attack surface minimal and behaviour easy to audit.
+// persisted settings file and key file (see the settings package), and built-in
+// defaults. The API key may come from the environment or the 0600 key file;
+// it is never written into the settings JSON or session transcript.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -93,11 +94,25 @@ type Config struct {
 	// AllowCommands and DenyCommands are regular expressions applied to
 	// run_command commands. A command matching DenyCommands is refused
 	// outright (even with AutoApprove); one matching AllowCommands runs
-	// without a prompt (even without AutoApprove). Deny wins over allow.
-	// Unmatched commands follow the normal approval flow. A built-in deny
-	// list for catastrophic commands is always applied on top of these.
+	// without a prompt (even without AutoApprove) only when the allow pattern
+	// matches the entire command. Deny wins over allow. Unmatched commands
+	// follow the normal approval flow. A built-in deny list for catastrophic
+	// commands is always applied on top of these.
 	AllowCommands []string
 	DenyCommands  []string
+
+	// PassEnv lists credential-like environment variable names that child
+	// processes may inherit despite scrubbing. DREA_API_KEY and OPENAI_API_KEY
+	// are never passed through even when listed.
+	PassEnv []string
+
+	// AllowInsecureKeyTransport permits sending an API key over plain HTTP.
+	// Prefer HTTPS; this is an explicit escape hatch even for loopback.
+	AllowInsecureKeyTransport bool
+
+	// AllowExternalDebugLog permits --debug paths outside the workspace.
+	// Debug logs contain raw prompts, model replies, and tool data.
+	AllowExternalDebugLog bool
 
 	// Debug dumps raw request/response traffic to the given path when non-empty.
 	Debug string
@@ -139,8 +154,8 @@ func Defaults(saved Saved) Config {
 		Workdir:         envOr("DREA_WORKDIR", wd),
 		AutoApprove:     envBool("DREA_AUTO_APPROVE"),
 		MaxSteps:        50,
-		Temperature:     1,
-		TopP:            0.95,
+		Temperature:     savedTemperature(saved),
+		TopP:            savedTopP(saved),
 		ReasoningEffort: envOr("DREA_REASONING_EFFORT", saved.ReasoningEffort),
 		JSONMode:        true,
 		JSONFormat:      envOr("DREA_JSON_FORMAT", firstNonEmpty(saved.JSONFormat, "json_schema")),
@@ -153,7 +168,40 @@ func Defaults(saved Saved) Config {
 		Persist:         !envBool("DREA_NO_PERSIST"),
 		AllowCommands:   envList("DREA_ALLOW_COMMANDS", saved.AllowCommands),
 		DenyCommands:    envList("DREA_DENY_COMMANDS", saved.DenyCommands),
+		Debug:           envOr("DREA_DEBUG", ""),
 	}
+}
+
+// DefaultTemperature is the sampling temperature used when none is configured.
+// Zero prefers deterministic replies and matches the documented default.
+const DefaultTemperature = 0.0
+
+// DefaultTopP is the nucleus-sampling value used when none is configured.
+// Zero means "omit top_p from the request" so the endpoint default applies.
+const DefaultTopP = 0.0
+
+func savedTemperature(saved Saved) float64 {
+	if env := os.Getenv("DREA_TEMPERATURE"); env != "" {
+		if v, err := strconv.ParseFloat(env, 64); err == nil {
+			return v
+		}
+	}
+	if saved.Temperature != 0 {
+		return saved.Temperature
+	}
+	return DefaultTemperature
+}
+
+func savedTopP(saved Saved) float64 {
+	if env := os.Getenv("DREA_TOP_P"); env != "" {
+		if v, err := strconv.ParseFloat(env, 64); err == nil {
+			return v
+		}
+	}
+	if saved.TopP != 0 {
+		return saved.TopP
+	}
+	return DefaultTopP
 }
 
 // Saved carries the persisted, non-secret preferences the config layer reads
@@ -168,6 +216,7 @@ type Saved struct {
 	Checkpoint      bool
 	ContextTokens   int
 	JSONFormat      string
+	Temperature     float64
 	TopP            float64
 	ReasoningEffort string
 	AllowCommands   []string
@@ -190,6 +239,10 @@ func (c *Config) Normalize() error {
 	abs, err := filepath.Abs(c.Workdir)
 	if err != nil {
 		return err
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return fmt.Errorf("resolve workdir: %w", err)
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
@@ -231,14 +284,124 @@ func (c *Config) Normalize() error {
 	if _, err := policy.New(c.AllowCommands, c.DenyCommands); err != nil {
 		return fmt.Errorf("invalid command policy pattern: %w", err)
 	}
-	if c.Debug != "" {
-		abs, err := filepath.Abs(c.Debug)
+	if err := c.validateKeyTransport(); err != nil {
+		return err
+	}
+	if err := c.normalizeDebugPath(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// normalizeDebugPath confines --debug under the workspace unless the user
+// explicitly opts into an external destination. Existing files are repaired
+// to 0600. Symlinks and non-regular destinations are rejected.
+func (c *Config) normalizeDebugPath() error {
+	if c.Debug == "" {
+		return nil
+	}
+	raw := c.Debug
+	var abs string
+	var err error
+	if filepath.IsAbs(raw) {
+		abs, err = filepath.Abs(raw)
+	} else {
+		abs, err = filepath.Abs(filepath.Join(c.Workdir, raw))
+	}
+	if err != nil {
+		return err
+	}
+	parent, err := canonicalExisting(filepath.Dir(abs))
+	if err != nil {
+		return fmt.Errorf("debug log parent %q: %w", filepath.Dir(abs), err)
+	}
+	abs = filepath.Join(parent, filepath.Base(abs))
+	if !c.AllowExternalDebugLog {
+		rel, err := filepath.Rel(c.Workdir, abs)
 		if err != nil {
 			return err
 		}
-		c.Debug = abs
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("debug log %q is outside the workspace; use a relative path under --workdir or pass --allow-external-debug-log", raw)
+		}
 	}
+	if info, err := os.Lstat(abs); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("debug log %q must not be a symlink", abs)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("debug log %q must be a regular file", abs)
+		}
+		f, err := os.Open(abs)
+		if err != nil {
+			return err
+		}
+		opened, statErr := f.Stat()
+		if statErr != nil {
+			f.Close()
+			return statErr
+		}
+		if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+			f.Close()
+			return fmt.Errorf("debug log %q changed during validation", abs)
+		}
+		if err := f.Chmod(0o600); err != nil {
+			f.Close()
+			return fmt.Errorf("secure debug log %q: %w", abs, err)
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	c.Debug = abs
 	return nil
+}
+
+// canonicalExisting resolves symlinks through the deepest existing ancestor,
+// retaining any not-yet-created suffix.
+func canonicalExisting(path string) (string, error) {
+	real, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return real, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return "", err
+	}
+	realParent, err := canonicalExisting(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(realParent, filepath.Base(path)), nil
+}
+
+// validateKeyTransport refuses to send an API key over plain HTTP unless the
+// user explicitly accepts cleartext key transport.
+func (c *Config) validateKeyTransport() error {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return nil
+	}
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return fmt.Errorf("invalid base URL %q: %w", c.BaseURL, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if c.AllowInsecureKeyTransport {
+			return nil
+		}
+		host := strings.ToLower(u.Hostname())
+		return fmt.Errorf("refusing to send API key over plain HTTP to %q; use HTTPS or --allow-insecure-key-transport", host)
+	default:
+		return fmt.Errorf("unsupported base URL scheme %q; expected http or https", u.Scheme)
+	}
 }
 
 // ChatURL is the fully-qualified chat completions endpoint.

@@ -90,3 +90,64 @@ func TestPathPerWorkdirDiffers(t *testing.T) {
 		t.Fatal("transcripts should live in the same directory")
 	}
 }
+
+func TestLoadRejectsOversizedSession(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	wd := "/ws-oversized"
+	p, err := pathFor(wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Avoid allocating maxSize+1 in the test process: write a sparse-ish
+	// oversize file by writing past the limit with a seek when possible.
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, 1024)); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(maxSize, 0); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("x")); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, _, err := Load(wd); err == nil {
+		t.Fatal("expected oversized session to be rejected")
+	}
+}
+
+func TestSaveRepairsPermissiveSession(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	wd := "/ws-repair"
+	p, err := pathFor(wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("{}"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(Session{Workdir: wd}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("permissions = %o, want 600", info.Mode().Perm())
+	}
+}

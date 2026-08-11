@@ -5,6 +5,7 @@ package settings
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,8 +26,10 @@ type Settings struct {
 	// ContextTokens is the prompt-size budget above which history is compacted.
 	ContextTokens int `json:"context_tokens,omitempty"`
 	// JSONFormat selects the response_format variant sent to the endpoint.
-	// Valid values: json_schema, llamacpp, llamacpp-alt, json_object.
+	// Valid values: json_schema (default) or json_object.
 	JSONFormat string `json:"json_format,omitempty"`
+	// Temperature is the sampling temperature forwarded to the endpoint.
+	Temperature float64 `json:"temperature,omitempty"`
 	// TopP is the nucleus-sampling probability forwarded to the endpoint.
 	TopP float64 `json:"top_p,omitempty"`
 	// ReasoningEffort is the reasoning effort level forwarded to the endpoint.
@@ -66,9 +69,12 @@ func Load() (Settings, bool, error) {
 
 	// The settings file is a couple of short strings; refuse anything absurd
 	// rather than reading an unbounded amount into memory.
-	data, err := io.ReadAll(io.LimitReader(f, maxSize))
+	data, err := io.ReadAll(io.LimitReader(f, maxSize+1))
 	if err != nil {
 		return s, false, err
+	}
+	if len(data) > maxSize {
+		return s, false, fmt.Errorf("settings file exceeds %d byte limit", maxSize)
 	}
 	if err := json.Unmarshal(data, &s); err != nil {
 		return s, false, err
@@ -78,6 +84,9 @@ func Load() (Settings, bool, error) {
 
 // maxSize bounds how much of the settings file is read.
 const maxSize = 64 * 1024
+
+// maxKeySize bounds how much of the API key file is read.
+const maxKeySize = 8 * 1024
 
 // Save writes the settings file, creating the config directory as needed. The
 // file is written with 0600 permissions.
@@ -94,7 +103,7 @@ func Save(s Settings) (string, error) {
 		return "", err
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(p, data, 0o600); err != nil {
+	if err := writePrivate(p, data); err != nil {
 		return "", err
 	}
 	return p, nil
@@ -120,12 +129,20 @@ func LoadKey() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	data, err := os.ReadFile(p)
+	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", false, nil
 		}
 		return "", false, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
+	if err != nil {
+		return "", false, err
+	}
+	if len(data) > maxKeySize {
+		return "", false, fmt.Errorf("key file exceeds %d byte limit", maxKeySize)
 	}
 	k := strings.TrimSpace(string(data))
 	return k, k != "", nil
@@ -149,8 +166,47 @@ func SaveKey(key string) (string, error) {
 		}
 		return p, nil
 	}
-	if err := os.WriteFile(p, []byte(key+"\n"), 0o600); err != nil {
+	if err := writePrivate(p, []byte(key+"\n")); err != nil {
 		return "", err
 	}
 	return p, nil
+}
+
+// writePrivate writes data via a temp file with 0600 mode, then renames into
+// place. It also Chmods the final path so a pre-existing permissive file is
+// repaired even on filesystems where rename preserves the destination inode.
+func writePrivate(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".drea-private-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	// Repair unusual filesystems that retain destination permission bits.
+	return os.Chmod(path, 0o600)
 }

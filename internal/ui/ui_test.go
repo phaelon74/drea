@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSanitizeLine(t *testing.T) {
@@ -22,6 +24,17 @@ func TestSanitizeLine(t *testing.T) {
 		if got := sanitizeLine(c.in, 4); got != c.want {
 			t.Errorf("sanitizeLine(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestNewWithIOUsesInjectedStreams(t *testing.T) {
+	var out bytes.Buffer
+	u := NewWithIO(strings.NewReader("yes\n"), &out)
+	if !u.Confirm("continue?") {
+		t.Fatal("injected input was not used")
+	}
+	if !strings.Contains(out.String(), "continue?") {
+		t.Fatalf("injected output = %q", out.String())
 	}
 }
 
@@ -197,5 +210,157 @@ func TestTermWidthFallback(t *testing.T) {
 	// back to a sane default rather than 0.
 	if w := termWidth(); w <= 0 {
 		t.Errorf("termWidth = %d, want > 0", w)
+	}
+}
+
+func TestInfoStripsESC(t *testing.T) {
+	var buf bytes.Buffer
+	u := &UI{out: &buf, colour: false}
+	u.Info("hello\x1b[31mRED\x1b[0m\x07world")
+	got := buf.String()
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Errorf("Info left control characters: %q", got)
+	}
+	if !strings.Contains(got, "helloREDworld") {
+		t.Errorf("Info dropped visible text: %q", got)
+	}
+}
+
+func TestStatusBarStripsESC(t *testing.T) {
+	var buf bytes.Buffer
+	u := &UI{out: &buf, colour: false, tty: true}
+	u.SetStatus(10, 100)
+	u.SetStatusWorkdir("/tmp/\x1b[31mevil\x1b[0m")
+	u.SetStatusMessage("msg\x1b[2K\x07boom")
+	u.ShowStatus()
+	got := buf.String()
+	if strings.Contains(got, "\x1b[31m") || strings.Contains(got, "\x1b[2K") || strings.Contains(got, "\x07") {
+		t.Errorf("status bar left ESC/control sequences: %q", got)
+	}
+	if !strings.Contains(got, "evil") || !strings.Contains(got, "boom") {
+		t.Errorf("status bar dropped visible text: %q", got)
+	}
+}
+
+func TestPrintlnStripsESC(t *testing.T) {
+	var buf bytes.Buffer
+	u := &UI{out: &buf, colour: false}
+	u.Println("a\x1b[31mb\x07c")
+	if got := buf.String(); strings.ContainsAny(got, "\x1b\x07") || !strings.Contains(got, "abc") {
+		t.Errorf("Println = %q", got)
+	}
+}
+
+func TestBannerAndConfirmSanitizeUntrustedText(t *testing.T) {
+	var buf bytes.Buffer
+	u := &UI{
+		out:       &buf,
+		in:        bufio.NewReader(strings.NewReader("n\n")),
+		colour:    false,
+		lineStart: true,
+	}
+	u.Banner("m\x1b[31model", "work\x07dir", false)
+	u.Confirm("approve\x1b[2J?")
+	got := buf.String()
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Fatalf("banner/confirm emitted controls: %q", got)
+	}
+	if !strings.Contains(got, "mmodel") || !strings.Contains(got, "workdir") || !strings.Contains(got, "approve?") {
+		t.Fatalf("banner/confirm dropped visible text: %q", got)
+	}
+}
+
+type overlapWriter struct {
+	bytes.Buffer
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *overlapWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.entered)
+		<-w.release
+	})
+	return w.Buffer.Write(p)
+}
+
+// TestConcurrentOutputNoHang exercises concurrent calls to Info, Warn,
+// Assistant, status, StartThinking and StopThinking under the race detector.
+func TestConcurrentOutputNoHang(t *testing.T) {
+	writer := &overlapWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	u := &UI{out: writer, colour: false, tty: true, lineStart: true}
+	u.SetStatus(50, 100)
+
+	start := make(chan struct{})
+	done := make(chan struct{})
+	var workers sync.WaitGroup
+	var ready sync.WaitGroup
+	workers.Add(4)
+	ready.Add(4)
+	go func() {
+		defer workers.Done()
+		<-start
+		ready.Done()
+		for i := 0; i < 50; i++ {
+			u.Info("info line")
+			u.Warn("warn line")
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		ready.Done()
+		for i := 0; i < 50; i++ {
+			u.AssistantHeader()
+			u.Assistant("chunk ")
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		ready.Done()
+		for i := 0; i < 50; i++ {
+			u.SetStatus(i, 100)
+			u.SetStatusMessage("working")
+			u.ShowStatus()
+			u.HideStatus()
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		ready.Done()
+		for i := 0; i < 50; i++ {
+			u.StartThinking()
+			u.StopThinking()
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	close(start)
+
+	readyDone := make(chan struct{})
+	go func() {
+		ready.Wait()
+		close(readyDone)
+	}()
+	select {
+	case <-readyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("UI workers did not overlap")
+	}
+	select {
+	case <-writer.entered:
+		close(writer.release)
+	case <-time.After(2 * time.Second):
+		t.Fatal("UI writer was not exercised")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent UI operations deadlocked")
 	}
 }

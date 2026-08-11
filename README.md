@@ -9,17 +9,20 @@ OpenAI-compatible model through a reason–act loop with a small, auditable set
 of tools, enough to build a software project locally from start to finish.
 
 It deliberately avoids Node.js, package managers, and external runtimes. The
-result is a single static binary with a tiny attack surface: no `node_modules`,
-no supply chain, nothing to install at runtime.
+result is a single binary with a tiny attack surface: no `node_modules`,
+no supply chain, nothing to install at runtime. For a fully static binary with
+no libc dependency, build with `CGO_ENABLED=0`.
 
 ## Why this design
 
 - **No dependencies.** HTTP, TLS, JSON and SSE streaming all come from Go's
   standard library. `go.mod` lists no `require`s.
-- **Single static binary.** Nothing to install on the target machine; nothing
-  interpreted.
-- **Confined by default.** Every file/search/command tool is restricted to a
-  single workspace root; path traversal (`../`) outside it is rejected.
+- **Single binary.** Nothing to install on the target machine; nothing
+  interpreted. Fully static with `CGO_ENABLED=0`.
+- **Confined by default.** Every file/search/command tool starts in a
+  single workspace root; path traversal (`../`) outside it is rejected for file
+  tools. `run_command` can access the host; worktrees isolate ordinary repo
+  edits, not arbitrary shell effects.
 - **Approval by default.** Commands and file writes require interactive
   confirmation unless you pass `--auto`. Writes and edits are shown as a
   coloured diff before they are applied.
@@ -52,7 +55,13 @@ make build        # produces ./drea
 go build -o drea ./cmd/drea
 ```
 
-Run the tests (standard library only):
+Run the full verification gate (format, vet, tests, race, build):
+
+```sh
+make verify
+```
+
+Run the tests alone (standard library only):
 
 ```sh
 make test
@@ -70,11 +79,11 @@ go version                       # expect go1.19.x from Debian
 
 git clone https://github.com/dreaagent/drea.git
 cd drea
-go build -o drea ./cmd/drea      # -> ./drea (make is optional)
+CGO_ENABLED=0 go build -o drea ./cmd/drea      # -> ./drea static binary
 ```
 
-That's it — `./drea` is a single static binary with no runtime dependencies.
-Optionally put it on your PATH:
+That's it — with `CGO_ENABLED=0`, `./drea` is a single static binary with no
+runtime dependencies. Optionally put it on your PATH:
 
 ```sh
 sudo install -m 0755 drea /usr/local/bin/drea
@@ -110,10 +119,11 @@ file and an optional key file, in that order of precedence:
 | `--workdir` | `DREA_WORKDIR` | current dir | Workspace root the agent is confined to |
 | `--auto` | `DREA_AUTO_APPROVE` | off | Skip confirmation for commands/writes |
 | `--max-steps` | — | 50 | Max model turns per task |
-| `--temperature` | — | 0 | Sampling temperature |
-| `--top-p` | — | 0 (endpoint default) | Nucleus-sampling probability; omitting it keeps the endpoint default |
+| `--temperature` | `DREA_TEMPERATURE` | 0 (saved value) | Sampling temperature (0 = deterministic; persisted via `/save`) |
+| `--top-p` | `DREA_TOP_P` | 0 (saved value; omit when zero) | Nucleus-sampling probability; 0 omits it from the request so the endpoint default is used |
 | `--reasoning-effort` | `DREA_REASONING_EFFORT` | — (saved value) | Reasoning effort level: `low`, `medium` or `high`; empty means the endpoint default (persisted via `/save`) |
-| `--no-json-mode` | — | off | Disable the JSON strict JSON tool-call schema (`response_format`); only use with endpoints that do not support it |
+| `--no-json-mode` | — | off | Disable the strict JSON tool-call schema (`response_format`); only use with endpoints that do not support it |
+| `--json-format` | `DREA_JSON_FORMAT` | `json_schema` | Response-format variant: `json_schema` for OpenAI structured outputs, or `json_object` for llama.cpp/older servers |
 | `--verify` | `DREA_VERIFY` | — | Command run when a task completes; failures are fed back for self-correction |
 | `--verify-attempts` | `DREA_VERIFY_ATTEMPTS` | 3 | How many times a failing verify command is fed back before giving up |
 | `--checkpoint` | `DREA_CHECKPOINT` | off | Commit the workspace before each task (and measure `--verify` first) so a task that regresses it can be rolled back |
@@ -124,6 +134,11 @@ file and an optional key file, in that order of precedence:
 | `--resume` | — | off | Resume the most recent saved session for this workspace |
 | `--allow` (repeatable) | `DREA_ALLOW_COMMANDS` | — | Regex for a `run_command` command to auto-run without a prompt |
 | `--deny` (repeatable) | `DREA_DENY_COMMANDS` | — | Regex for a `run_command` command to block outright (wins over allow) |
+| `--pass-env` (repeatable) | — | — | Credential-like env var name to pass through to child processes (never DREA_API_KEY/OPENAI_API_KEY) |
+| `--debug` | `DREA_DEBUG` | — | Append raw prompts, replies and tool data to a private log under the workspace |
+| `--allow-insecure-key-transport` | — | off | Allow sending the API key over plain HTTP, including to loopback endpoints |
+| `--allow-external-debug-log` | — | off | Allow `--debug` paths outside the workspace (log contains raw prompts and tool data) |
+| `--allow-external-workdir` | — | off | (eval only) Allow task specs whose `workdir` resolves outside the spec directory |
 
 The `DREA_ALLOW_COMMANDS` / `DREA_DENY_COMMANDS` environment variables take a
 newline-separated list of regexes; each `--allow` / `--deny` flag adds one
@@ -135,8 +150,8 @@ read back from disk on every start, so a bare `./drea` works.
 
 ### Settings file
 
-The base URL, model, verify command, checkpointing, context budget, reasoning
-effort and command policy can be persisted to `~/.config/drea/settings.json`
+The base URL, model, sampling values, verify command, checkpointing, context
+budget, reasoning effort and command policy can be persisted to `~/.config/drea/settings.json`
 (follows `XDG_CONFIG_HOME`) with the `/save` command in an interactive session.
 The file is written `0600`. The API key is never stored in it — `/save` writes
 the key to its own file, `~/.config/drea/key` (also `0600`), and on startup the
@@ -235,10 +250,10 @@ A worktree starts from `HEAD`, so uncommitted changes in the original tree are
 working from a different state than you are looking at. It needs a repository
 with at least one commit and refuses to start otherwise.
 
-### Command policy (unattended, reversible autonomy)
+### Command policy (selective auto-approval)
 
 The command policy classifies each `run_command` the model wants to run so the
-harness can run unattended without blanket trust:
+harness can auto-run narrowly specified commands without blanket `--auto`:
 
 - **deny** — matching commands are refused outright and never executed, *even
   with `--auto`*. Deny always wins over allow.
@@ -254,9 +269,9 @@ of configuration; user allow patterns cannot override it. Patterns are Go
 rejected at startup.
 
 ```sh
-# Run unattended: auto-run tests and git inspection, block network fetches.
-drea --auto \
-  --allow '^go (test|build|vet)\b' --allow '^git (status|diff|log|show)\b' \
+# Auto-run these exact checks; prompt for anything else and block network fetches.
+drea \
+  --allow '^go test ./\.\.\.$' --allow '^go vet ./\.\.\.$' --allow '^git status$' \
   --deny '\b(curl|wget)\b' \
   "refactor the parser and keep the tests green"
 ```
@@ -276,7 +291,8 @@ safety net for iterating on a codebase:
 - `git_inspect` (read-only): `status`, `diff` (optional `path`/`staged`), `log`,
   `show`.
 - `git_init`: create a repository when the workspace isn't under version control
-  yet. Idempotent, and it never nests a second repository inside an existing one.
+  at its own root. Idempotent; a workspace inside a parent repository may create
+  a nested repository so later mutations remain confined to that workspace.
 - `git_commit`: stage changes (all by default, or specific `paths`) and create
   a checkpoint commit; requires a `message`.
 - `git_rollback`: `git reset --hard` back to a `ref` (default `HEAD`),
@@ -304,7 +320,14 @@ repository with no commits yet report `(no commits yet)` rather than failing.
 
 `drea eval <dir>` runs every `*.json` task spec in a directory and scores each
 by its own verify command, printing a pass/fail report and exiting non-zero if
-any fail. This makes repeated self-improvement measurable. A spec looks like:
+any fail. This makes repeated self-improvement measurable.
+
+**Trust boundary:** task specifications are trusted executable input. Their
+`setup` and `verify` fields run as shell commands. Relative `workdir` values
+must stay under `<dir>`; pass `--allow-external-workdir` only for trusted
+suites that intentionally use fixtures elsewhere.
+
+A spec looks like:
 
 ```json
 {
@@ -334,7 +357,7 @@ tasks:
 | `/policy` | Show the `run_command` allow/deny policy (incl. built-in denies) |
 | `/reasoning [low\|medium\|high\|off]` | Show or set the reasoning effort level |
 | `/key [value\|off\|show]` | Show (masked) or set the API key; `/save` persists it |
-| `/save` | Persist model + base URL + verify + policy + reasoning + API key |
+| `/save` | Persist model + base URL + sampling + verify + policy + reasoning + API key |
 | `/resume` | Reload the saved transcript for this workspace |
 | `/reset` | Clear the conversation history |
 | `/tools` | List the available tools |
@@ -365,7 +388,9 @@ drea --base-url http://localhost:8080/v1 --model my-local-model "…"
 
 ## Tools
 
-The model is given eleven tools, all confined to the workspace root:
+The model is given twelve tools (eleven workspace actions plus a `reply`
+pseudo-tool used in JSON mode for ordinary assistant prose), all confined to
+the workspace root:
 
 | Tool | Mutating | Purpose |
 |------|----------|---------|
@@ -379,10 +404,12 @@ The model is given eleven tools, all confined to the workspace root:
 | `run_command` | **yes** | Run a shell command via `bash -c`, with timeout |
 | `git_init` | **yes** | Create a repository so work can be checkpointed |
 | `git_commit` | **yes** | Stage changes and create a checkpoint commit |
-| `git_rollback` | **yes** | `git reset --hard` to a ref (optionally clean untracked) |
+| `git_rollback` | **yes** | `git reset --hard` to a ref (optionally clean untracked); always confirms |
+| `reply` | no | JSON-mode pseudo-tool for ordinary assistant prose (not a real action) |
 
-Mutating tools prompt for approval unless `--auto` is set. `run_command` is
-additionally subject to the allow/deny command policy (see above).
+Mutating tools prompt for approval unless `--auto` is set. `git_rollback`
+always confirms, even under `--auto`. `run_command` is additionally subject to
+the allow/deny command policy (see above).
 
 ### Reliable edits
 
@@ -429,10 +456,11 @@ internal/tool/     tool registry and implementations (fs, search, shell)
 internal/agent/    reason-act loop, system prompt, approval handling
 internal/ui/       terminal output and prompts (ANSI, TTY-aware, live tail)
 internal/diff/     standard-library unified line diff
-internal/settings/ optional on-disk preferences (base URL + model, no secrets)
-internal/session/  resumable per-workspace transcript persistence (no secrets)
+internal/settings/ optional on-disk preferences + 0600 key file (API key not in settings.json)
+internal/session/  resumable per-workspace transcript persistence (API key never stored; user/tool text may contain secrets)
 internal/eval/     minimal evaluation scaffold (task specs + scoring)
 internal/policy/   allow/deny command policy (regex, deny-wins, built-in denies)
+internal/process/  bounded subprocess execution, environment filtering, process groups
 internal/patch/    multi-hunk edit engine (exact, then whitespace-tolerant)
 internal/vcs/      the harness's own git bookkeeping: checkpoints, worktrees
 internal/conventions/ discovery of the workspace's own instruction files
@@ -440,20 +468,34 @@ internal/conventions/ discovery of the workspace's own instruction files
 
 ## Security notes
 
-- File tools cannot read or write outside `--workdir`.
-- `run_command` is the one broad capability; it is gated by approval, bounded by
-  a wall-clock timeout, and its output is size-capped.
-- The only network egress is to the configured model endpoint. The API key is
-  sent solely as a `Bearer` token to that endpoint and is never logged.
-- The command policy (allow/deny) is defence in depth on top of approval, with
-  a built-in deny list for catastrophic commands that user config cannot
-  override. It is not a sandbox: it governs whether the harness runs or prompts
-  for a command, not what a running process may do.
+- File tools cannot read or write outside `--workdir`. Symlink escapes are
+  rejected for file and search tools; hard links and a concurrently hostile
+  local process still require OS isolation for an absolute guarantee.
+- `run_command` starts in the workspace root but can access the full host:
+  worktrees isolate ordinary repository edits, not arbitrary shell effects.
+  Real isolation requires OS-level sandboxing (namespaces, containers, VMs).
+- The command policy (allow/deny) is **best-effort defence in depth** on top of
+  approval, with a built-in deny list for catastrophic commands that user config
+  cannot override. Allow rules require a full-command regex match; they do not
+  sandbox what a running process may do.
+- Eval task specs (`drea eval`) are **trusted executable input**: they specify
+  the prompt, verify command, setup command and working directory. The `workdir`
+  in a spec is confined to the spec directory unless `--allow-external-workdir`
+  is passed.
+- Environment variable filtering (`--pass-env`): child processes receive only
+  a minimal platform/tooling environment by default. Additional named variables
+  are passed only when explicitly allowed. `DREA_API_KEY` and `OPENAI_API_KEY`
+  are **never** passed, even when listed.
+- The API key is sent solely as a `Bearer` token to the configured model
+  endpoint over HTTPS. Sending it over plain HTTP, including to loopback, is
+  refused unless `--allow-insecure-key-transport` is passed.
+- `--key` puts the API key in the process argument vector, visible to `ps` and
+  shell history; prefer `DREA_API_KEY`.
+- `--debug` (with `--allow-external-debug-log`) writes raw prompts, replies, and
+  tool data to the given path, which may leave the workspace.
 - Git tools are workspace-confined and run git with an explicit argument vector
   (never a shell string); refs and paths are validated and confined.
 - Project instructions are read only from regular files in the workspace root,
   never through symlinks, and are size-bounded.
-
-## Module path note
-
-The current `go.mod` declares `module drea` so the project builds cleanly from a directory named `drea` without a local `replace` directive. Before publishing as `github.com/dreaagent/drea`, update `go.mod` to `module github.com/dreaagent/drea` and change all imports from `drea/internal/...` to `github.com/dreaagent/drea/internal/...`, then verify with `go test ./...`.
+- The binary is a **single static binary only when built with
+  `CGO_ENABLED=0`**; the default `go build` may link against libc dynamically.

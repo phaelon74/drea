@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"strings"
 
 	"github.com/dreaagent/drea/internal/patch"
@@ -16,7 +16,8 @@ import (
 type applyPatch struct{ root string }
 
 func (t *applyPatch) Name() string   { return "apply_patch" }
-func (t *applyPatch) Mutating() bool { return true }
+func (t *applyPatch) Mutating() bool      { return true }
+func (t *applyPatch) AlwaysConfirm() bool { return false }
 func (t *applyPatch) Description() string {
 	return "Apply several find/replace edits to one file in a single call. Edits are applied in order and all must succeed, so the file is never left half-edited. If an exact match fails, the text is matched line-by-line ignoring leading/trailing whitespace, so small indentation differences still apply. A match must be unambiguous: include enough surrounding context, or set replace_all for an exactly repeated string. Prefer this over repeated edit_file calls when changing several places in the same file."
 }
@@ -58,7 +59,7 @@ func (t *applyPatch) Run(_ context.Context, args json.RawMessage) (string, error
 	if err != nil {
 		return "", err
 	}
-	res, err := applyEdits(p, a.Edits)
+	res, err := applyEdits(t.root, p, a.Edits)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", rel(t.root, p), err)
 	}
@@ -129,23 +130,33 @@ func ParseEdits(name string, args json.RawMessage) (path string, edits []patch.E
 }
 
 // applyEdits reads path, applies edits in memory and only writes when every
-// edit succeeded, so a failure part-way through leaves the file untouched.
+// edit succeeded. The secure write rejects a replaced destination. A hostile
+// process can still mutate the same inode through a hard link while it is read;
+// repository confinement does not imply isolation from local processes.
 // When an edit fails, the current file content is included in the error so the
-// model can retry with an old_string that matches the actual file.
-func applyEdits(path string, edits []patch.Edit) (patch.Result, error) {
-	data, err := os.ReadFile(path)
+// model can retry with an old_string that matches the actual file. display
+// paths in errors are relative to root.
+func applyEdits(root, path string, edits []patch.Edit) (patch.Result, error) {
+	f, mode, identity, err := openSecureRegular(root, path)
 	if err != nil {
 		return patch.Result{}, err
 	}
+	data, err := io.ReadAll(io.LimitReader(f, maxFileBytes+1))
+	f.Close()
+	if err != nil {
+		return patch.Result{}, err
+	}
+	if len(data) > maxFileBytes {
+		return patch.Result{}, fmt.Errorf("%s exceeds the %d byte read limit", rel(root, path), maxFileBytes)
+	}
 	res, err := patch.Apply(string(data), edits)
 	if err != nil {
-		return patch.Result{}, fmt.Errorf("%w\n\nCurrent file content (%s):\n%s", err, path, trimForError(string(data)))
+		return patch.Result{}, fmt.Errorf("%w\n\nCurrent file content (%s):\n%s", err, rel(root, path), trimForError(string(data)))
 	}
-	mode := os.FileMode(0o644)
-	if fi, err := os.Stat(path); err == nil {
-		mode = fi.Mode().Perm()
+	if len(res.Text) > maxFileBytes {
+		return patch.Result{}, fmt.Errorf("edited content exceeds the %d byte write limit", maxFileBytes)
 	}
-	if err := os.WriteFile(path, []byte(res.Text), mode); err != nil {
+	if err := secureWriteAtomic(root, path, []byte(res.Text), mode, &identity); err != nil {
 		return patch.Result{}, err
 	}
 	return res, nil

@@ -1,6 +1,10 @@
 package diff
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestStat(t *testing.T) {
 	added, removed := Stat("a\nb\nc\n", "a\nB\nc\nd\n")
@@ -50,6 +54,36 @@ func TestSplitLinesEmpty(t *testing.T) {
 	}
 	if got := splitLines("\n"); len(got) != 1 || got[0] != "" {
 		t.Fatalf("splitLines(newline) = %v, want [\"\"]", got)
+	}
+}
+
+func TestLinesRejectsHugeLineProduct(t *testing.T) {
+	// Many short lines: byte size is small, but n*m exceeds MaxLineProduct.
+	const n = 2000
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "%d\n", i)
+	}
+	old := b.String()
+	newText := old + "x\n"
+	if Fits(old, newText) {
+		t.Fatal("expected Fits to reject a large line-count product")
+	}
+	if got := Lines(old, newText); got != nil {
+		t.Fatalf("Lines should return nil when over budget, got %d lines", len(got))
+	}
+}
+
+func TestStatAndUnifiedShareLines(t *testing.T) {
+	old, nw := "a\nb\n", "a\nc\n"
+	lines := Lines(old, nw)
+	added, removed := StatLines(lines)
+	if added != 1 || removed != 1 {
+		t.Fatalf("StatLines = +%d/-%d, want +1/-1", added, removed)
+	}
+	out := UnifiedLines(lines, 3)
+	if !contains(out, "+ c") || !contains(out, "- b") {
+		t.Fatalf("unexpected unified:\n%s", out)
 	}
 }
 

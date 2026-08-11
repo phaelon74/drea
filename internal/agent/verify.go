@@ -5,14 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dreaagent/drea/internal/config"
 	"github.com/dreaagent/drea/internal/tool"
 	"github.com/dreaagent/drea/internal/vcs"
 )
-
-// DefaultVerifyAttempts bounds how many times a failing verification command is
-// fed back for self-correction, so a change the model cannot fix cannot loop
-// forever (each attempt also counts against MaxSteps).
-const DefaultVerifyAttempts = 3
 
 // The verification command is the harness's only objective measure of whether
 // a task succeeded. Everything here generalises that single check into a goal:
@@ -98,7 +94,7 @@ func (a *Agent) verify(ctx context.Context) (feedback string, retry bool) {
 	}
 	attempts := a.cfg.VerifyAttempts
 	if attempts <= 0 {
-		attempts = DefaultVerifyAttempts
+		attempts = config.DefaultVerifyAttempts
 	}
 	if a.verifyRounds >= attempts {
 		a.ui.Warn(fmt.Sprintf("  verification still failing after %d attempts; stopping.", attempts))

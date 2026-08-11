@@ -1,15 +1,15 @@
 package tool
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
+
+	dreaprocess "github.com/dreaagent/drea/internal/process"
 )
 
 // runCommand executes a shell command inside the workspace root. It is the
@@ -27,8 +27,21 @@ const defaultCommandTimeout = 120 * time.Second
 // memory or flood the model's context.
 const maxOutputBytes = 64 * 1024
 
-func (t *runCommand) Name() string   { return "run_command" }
-func (t *runCommand) Mutating() bool { return true }
+// SetPassEnv configures which credential-like environment variable names may
+// be passed through to child processes despite scrubbing. DREA_API_KEY and
+// OPENAI_API_KEY are never passed, even when listed.
+func SetPassEnv(names []string) {
+	dreaprocess.SetPassEnv(names)
+}
+
+// PassEnv returns a copy of the current pass-through allow-list.
+func PassEnv() []string {
+	return dreaprocess.PassEnv()
+}
+
+func (t *runCommand) Name() string        { return "run_command" }
+func (t *runCommand) Mutating() bool      { return true }
+func (t *runCommand) AlwaysConfirm() bool { return false }
 func (t *runCommand) Description() string {
 	return "Run a shell command with 'bash -c' from the workspace root. Combined stdout and stderr are returned along with the exit code. Use this to build, run tests, install project-local dependencies, use git, etc. Long-running or interactive processes are not supported."
 }
@@ -72,42 +85,9 @@ func (t *runCommand) Run(ctx context.Context, args json.RawMessage) (string, err
 		timeout = maxCommandTimeout
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Run in its own process group so a timeout/cancel kills the whole tree
-	// (bash plus any children), not just the bash leader.
-	cmd := exec.Command("bash", "-c", a.Command)
-	cmd.Dir = t.root
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Cap output as it is produced so a runaway command cannot exhaust memory;
-	// the process keeps running (its writes are discarded past the cap).
-	sink := &capWriter{limit: maxOutputBytes}
-	cmd.Stdout = sink
-	cmd.Stderr = sink
-
-	if err := cmd.Start(); err != nil {
+	text, exitCode, timedOut, err := runArgv(ctx, t.root, "bash", []string{"-c", a.Command}, timeout)
+	if err != nil {
 		return "", err
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	var runErr error
-	select {
-	case <-cctx.Done():
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		<-done // reap
-		runErr = cctx.Err()
-	case runErr = <-done:
-	}
-	timedOut := cctx.Err() == context.DeadlineExceeded
-
-	text := sink.String()
-	if sink.overflow {
-		text += "\n… (output truncated)"
 	}
 
 	var b strings.Builder
@@ -116,16 +96,12 @@ func (t *runCommand) Run(ctx context.Context, args json.RawMessage) (string, err
 	}
 	b.WriteString(text)
 	switch {
-	case runErr == nil:
+	case exitCode == 0:
 		b.WriteString("\n[exit code 0]")
 	case timedOut:
 		// message already emitted above
 	default:
-		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			fmt.Fprintf(&b, "\n[exit code %d]", exitErr.ExitCode())
-		} else {
-			fmt.Fprintf(&b, "\n[error: %v]", runErr)
-		}
+		fmt.Fprintf(&b, "\n[exit code %d]", exitCode)
 	}
 	return b.String(), nil
 }
@@ -151,75 +127,27 @@ func runArgv(ctx context.Context, dir, name string, args []string, timeout time.
 	if timeout > maxCommandTimeout {
 		timeout = maxCommandTimeout
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	sink := &capWriter{limit: maxOutputBytes}
-	cmd.Stdout = sink
-	cmd.Stderr = sink
-
-	if err := cmd.Start(); err != nil {
-		return "", -1, false, err
+	result := dreaprocess.Run(ctx, dir, append([]string{name}, args...), timeout, maxOutputBytes)
+	if !result.Started {
+		return "", -1, false, result.Err
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	var runErr error
-	select {
-	case <-cctx.Done():
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		<-done
-		runErr = cctx.Err()
-	case runErr = <-done:
-	}
-	timedOut = cctx.Err() == context.DeadlineExceeded
-
-	text := sink.String()
-	if sink.overflow {
+	text := result.Output
+	if result.Truncated {
 		text += "\n… (output truncated)"
 	}
+	timedOut = result.TimedOut
 	switch {
-	case runErr == nil:
+	case result.Err == nil:
 		exitCode = 0
 	case timedOut:
 		exitCode = -1
 	default:
-		if exitErr, ok := runErr.(*exec.ExitError); ok {
+		if exitErr, ok := result.Err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			exitCode = -1
-			text += fmt.Sprintf("\n[error: %v]", runErr)
+			text += fmt.Sprintf("\n[error: %v]", result.Err)
 		}
 	}
 	return text, exitCode, timedOut, nil
 }
-
-// capWriter buffers up to limit bytes and discards the rest, recording whether
-// any data was dropped. Write never blocks or errors, so the child process is
-// free to keep producing output that we simply ignore past the cap.
-type capWriter struct {
-	buf      bytes.Buffer
-	limit    int
-	overflow bool
-}
-
-func (w *capWriter) Write(p []byte) (int, error) {
-	if room := w.limit - w.buf.Len(); room > 0 {
-		if len(p) > room {
-			w.buf.Write(p[:room])
-			w.overflow = true
-		} else {
-			w.buf.Write(p)
-		}
-	} else if len(p) > 0 {
-		w.overflow = true
-	}
-	return len(p), nil
-}
-
-func (w *capWriter) String() string { return w.buf.String() }

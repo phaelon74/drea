@@ -168,3 +168,141 @@ func TestParseEdits(t *testing.T) {
 		t.Error("apply_patch without edits must not parse")
 	}
 }
+
+func TestApplyPatchErrorUsesRelativePath(t *testing.T) {
+	root := t.TempDir()
+	writeTemp(t, root, "sub/a.txt", "hello\n")
+	ap := &applyPatch{root: root}
+	_, err := run(t, ap, map[string]any{
+		"path":  "sub/a.txt",
+		"edits": []map[string]any{{"old_string": "missing", "new_string": "x"}},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Fatalf("error should use a relative path, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "sub/a.txt") {
+		t.Fatalf("error should name the relative path, got %v", err)
+	}
+}
+
+func TestWriteFileRejectsOversizeContent(t *testing.T) {
+	root := t.TempDir()
+	w := &writeFile{root: root}
+	big := strings.Repeat("x", maxFileBytes+1)
+	if _, err := run(t, w, map[string]any{"path": "big.txt", "content": big}); err == nil {
+		t.Fatal("expected oversize write to be rejected")
+	}
+}
+
+func TestReadFileRejectsOversizeFile(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "big.txt")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, maxFileBytes+1)); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	r := &readFile{root: root}
+	if _, err := run(t, r, map[string]any{"path": "big.txt"}); err == nil {
+		t.Fatal("expected oversize read to be rejected")
+	}
+}
+
+func TestWriteFileRejectsNonRegular(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := &writeFile{root: root}
+	if _, err := run(t, w, map[string]any{"path": "dir", "content": "x"}); err == nil {
+		t.Fatal("expected write to a directory to be rejected")
+	}
+}
+
+func TestFileToolsRejectFinalSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := writeTemp(t, root, "target.txt", "old\n")
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := run(t, &readFile{root: root}, map[string]any{"path": "link.txt"}); err == nil {
+		t.Error("read_file accepted a final symlink")
+	}
+	if _, err := run(t, &writeFile{root: root}, map[string]any{"path": "link.txt", "content": "new\n"}); err == nil {
+		t.Error("write_file accepted a final symlink")
+	}
+	if _, err := run(t, &editFile{root: root}, map[string]any{"path": "link.txt", "old_string": "old", "new_string": "new"}); err == nil {
+		t.Error("edit_file accepted a final symlink")
+	}
+}
+
+func TestWriteFilePreservesExecutableMode(t *testing.T) {
+	root := t.TempDir()
+	p := writeTemp(t, root, "run.sh", "old\n")
+	if err := os.Chmod(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, &writeFile{root: root}, map[string]any{"path": "run.sh", "content": "new\n"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("mode = %o, want 755", info.Mode().Perm())
+	}
+}
+
+func TestSecureWriteRejectsDestinationReplacement(t *testing.T) {
+	root := t.TempDir()
+	p := writeTemp(t, root, "file.txt", "first")
+	mode, expected, err := inspectSecureTarget(root, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := writeTemp(t, root, "replacement.txt", "second")
+	if err := os.Rename(replacement, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureWriteAtomic(root, p, []byte("third"), mode, expected); err == nil {
+		t.Fatal("expected replaced destination to be rejected")
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "second" {
+		t.Fatalf("replacement was overwritten: %q", data)
+	}
+}
+
+func TestSecureWriteRejectsAppearingDestination(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "new.txt")
+	mode, expected, err := inspectSecureTarget(root, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("hostile"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureWriteAtomic(root, p, []byte("wanted"), mode, expected); err == nil {
+		t.Fatal("expected appearing destination to be rejected")
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hostile" {
+		t.Fatalf("appearing destination was overwritten: %q", data)
+	}
+}

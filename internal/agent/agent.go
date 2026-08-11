@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -26,9 +25,10 @@ import (
 // state. It is safe to reuse across multiple user turns (interactive mode).
 type Agent struct {
 	cfg      config.Config
-	client   *llm.Client
+	client   modelClient
 	tools    *tool.Registry
 	ui       *ui.UI
+	confirm  func(string) bool
 	policy   *policy.Policy
 	messages []llm.Message
 
@@ -49,10 +49,19 @@ type Agent struct {
 	objective Measure
 
 	stall stallDetector
+	// emptyNudged records that an empty assistant turn already received one
+	// corrective nudge; a second empty turn fails the task instead of looping.
+	emptyNudged bool
 	// task and total accumulate reported token usage for the current task and
 	// for the session, so a runaway loop is visible in what it costs.
 	task  Usage
 	total Usage
+}
+
+type modelClient interface {
+	Stream(context.Context, []llm.Message, []llm.Tool, llm.Handlers) (*llm.Result, error)
+	StreamWithOptions(context.Context, []llm.Message, []llm.Tool, llm.Handlers, llm.StreamOpts) (*llm.Result, error)
+	JSONMode() bool
 }
 
 // Usage is cumulative token accounting as reported by the endpoint.
@@ -62,10 +71,13 @@ type Usage struct {
 	Requests         int
 }
 
-func (u Usage) add(v llm.Usage) Usage {
+func (u Usage) add(v llm.Usage, attempts int) Usage {
 	u.PromptTokens += v.PromptTokens
 	u.CompletionTokens += v.CompletionTokens
-	u.Requests++
+	if attempts <= 0 {
+		attempts = 1
+	}
+	u.Requests += attempts
 	return u
 }
 
@@ -78,6 +90,26 @@ func (u Usage) String() string {
 
 // Usage reports token accounting for the session so far.
 func (a *Agent) Usage() Usage { return a.total }
+
+// SetAutoApprove updates whether mutating tools skip confirmation. Slash
+// commands must call this rather than mutating a copy of Config that the
+// agent does not see.
+func (a *Agent) SetAutoApprove(v bool) { a.cfg.AutoApprove = v }
+
+// SetVerify updates the verification command used when a task finishes.
+func (a *Agent) SetVerify(cmd string) { a.cfg.Verify = cmd }
+
+// SetCheckpoint updates whether each task is checkpointed before work starts.
+func (a *Agent) SetCheckpoint(v bool) { a.cfg.Checkpoint = v }
+
+// AutoApprove reports whether mutating tools currently skip confirmation.
+func (a *Agent) AutoApprove() bool { return a.cfg.AutoApprove }
+
+// VerifyCommand reports the current verification command, if any.
+func (a *Agent) VerifyCommand() string { return a.cfg.Verify }
+
+// Checkpointing reports whether per-task checkpointing is enabled.
+func (a *Agent) Checkpointing() bool { return a.cfg.Checkpoint }
 
 // New constructs an agent with a seeded system prompt.
 func New(cfg config.Config, client *llm.Client, tools *tool.Registry, u *ui.UI) *Agent {
@@ -92,9 +124,10 @@ func New(cfg config.Config, client *llm.Client, tools *tool.Registry, u *ui.UI) 
 		client: client,
 		tools:  tools,
 		ui:     u,
+		confirm: u.Confirm,
 		policy: pol,
 		messages: []llm.Message{
-			{Role: llm.RoleSystem, Content: systemPrompt(cfg.Workdir, tools.Names())},
+			{Role: llm.RoleSystem, Content: systemPrompt(cfg.Workdir, tools.Names(), cfg.JSONMode)},
 		},
 	}
 }
@@ -105,6 +138,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: userInput})
 	a.verifyRounds = 0
 	a.task = Usage{}
+	a.emptyNudged = false
 	a.stall.reset()
 	a.persist()
 	a.beginTask(ctx, userInput)
@@ -143,15 +177,17 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		})
 		live.close()
 		a.ui.StopThinking()
+		if res != nil {
+			if res.Usage.PromptTokens > 0 {
+				a.lastPromptTokens = res.Usage.PromptTokens
+			}
+			a.task, a.total = a.task.add(res.Usage, res.Attempts), a.total.add(res.Usage, res.Attempts)
+			a.updateStatus()
+		}
 		if err != nil {
 			return err
 		}
 		ensureNL()
-		if res.Usage.PromptTokens > 0 {
-			a.lastPromptTokens = res.Usage.PromptTokens
-		}
-		a.task, a.total = a.task.add(res.Usage), a.total.add(res.Usage)
-		a.updateStatus()
 
 		// Record the assistant turn (content and/or tool calls).
 		// Keep the recorded message in sync with any post-processing below
@@ -175,38 +211,10 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 				recorded.Content = res.Content
 			}
 		}
-		// JSON-mode "reply" pseudo-tools were already converted to content by
-		// the client; make sure the assistant message records that content.
-		if a.client.JSONMode() && len(res.ToolCalls) == 0 && res.Content != "" {
-			recorded.Content = res.Content
-		}
-
-		if len(res.ToolCalls) == 0 {
-			// The model believes the task is done: run the verification
-			// command (if any) and feed a failure back for self-correction.
-			if fb, retry := a.verify(ctx); retry {
-				a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: fb})
-				a.persist()
-				continue
-			}
-			// In JSON mode an empty assistant turn is not a meaningful final
-			// reply; it usually means the model emitted a vacuous reply tool.
-			// Nudge it to produce a real action rather than returning silence.
-			if a.client.JSONMode() && recorded.Content == "" && len(recorded.ToolCalls) == 0 {
-				a.ui.Warn("│  model returned an empty reply; asking for a real action.")
-				a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Your last response was empty. Please continue the task by issuing a real tool call or a non-empty reply."})
-				a.persist()
-				continue
-			}
-			a.persist()
-			return nil // task turn complete
-		}
-
-		// A non-empty "reply" pseudo-tool is not a real tool; treat it as
-		// assistant prose and end the turn. This can happen when the model emits
-		// a reply through the native tool_calls channel instead of JSON-mode
-		// content. Empty replies are ignored so they do not stall the task.
-		if allReplies(res.ToolCalls) {
+		// A turn containing only reply pseudo-tools is assistant prose, including
+		// the empty case. Classify it before verification so a vacuous reply
+		// receives the same bounded correction as empty native content.
+		if onlyReplies(res.ToolCalls) {
 			msg := joinReplyMessages(res.ToolCalls)
 			res.Content = msg
 			res.ToolCalls = nil
@@ -220,13 +228,6 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 				a.ui.Assistant(msg)
 				contentOpen = !strings.HasSuffix(msg, "\n")
 			}
-			if fb, retry := a.verify(ctx); retry {
-				a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: fb})
-				a.persist()
-				continue
-			}
-			a.persist()
-			return nil
 		}
 
 		// If the model mixed a reply with real tools, drop the reply and execute
@@ -240,6 +241,29 @@ func (a *Agent) Run(ctx context.Context, userInput string) error {
 		}
 		res.ToolCalls = filtered
 		recorded.ToolCalls = res.ToolCalls
+
+		if len(res.ToolCalls) == 0 {
+			if emptyAssistantContent(res.Content, a.client.JSONMode()) {
+				res.Content = ""
+				recorded.Content = ""
+				if !a.emptyNudged {
+					a.emptyNudged = true
+					a.ui.Warn("│  model returned an empty reply; asking for a real action.")
+					a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Your last response was empty. Please continue the task by issuing a real tool call or a non-empty reply."})
+					a.persist()
+					continue
+				}
+				return errors.New("model returned repeated empty replies")
+			}
+			// Only meaningful final output is eligible for verification.
+			if fb, retry := a.verify(ctx); retry {
+				a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: fb})
+				a.persist()
+				continue
+			}
+			a.persist()
+			return nil
+		}
 
 		nudge, abort := a.stall.observe(res.ToolCalls)
 		for _, tc := range res.ToolCalls {
@@ -287,7 +311,7 @@ func (a *Agent) dispatch(ctx context.Context, tc llm.ToolCall) string {
 		a.ui.Info(fmt.Sprintf("│  (+%d/-%d)", added, removed))
 	}
 
-	requireApproval := t.Mutating() && !a.cfg.AutoApprove
+	requireApproval := (t.Mutating() && !a.cfg.AutoApprove) || t.AlwaysConfirm()
 	// The command policy governs run_command specifically: a denied command is
 	// refused regardless of auto-approve; an allowed one runs without a prompt.
 	if t.Name() == "run_command" {
@@ -301,7 +325,12 @@ func (a *Agent) dispatch(ctx context.Context, tc llm.ToolCall) string {
 		}
 	}
 	if requireApproval {
-		if !a.ui.Confirm("│  approve this action?") {
+		if t.Name() == "run_command" {
+			for _, line := range approvalCommandLines(commandArg(args)) {
+				a.ui.Info("│  " + line)
+			}
+		}
+		if !a.confirm("│  approve this action?") {
 			a.ui.Warn("│  denied by user")
 			return "The user denied this action. Consider a different approach or ask what to do."
 		}
@@ -316,23 +345,29 @@ func (a *Agent) dispatch(ctx context.Context, tc llm.ToolCall) string {
 	return out
 }
 
-// allReplies reports whether every tool call is a non-empty "reply" pseudo-tool.
-// Vacuous reply tools are ignored so a confused model cannot end the turn with
-// an empty message.
-func allReplies(tcs []llm.ToolCall) bool {
+// onlyReplies reports whether every tool call is a "reply" pseudo-tool.
+func onlyReplies(tcs []llm.ToolCall) bool {
 	if len(tcs) == 0 {
 		return false
 	}
-	hasReply := false
 	for _, tc := range tcs {
 		if !llm.IsReplyCall(tc) {
 			return false
 		}
-		if llm.ReplyMessage(tc) != "" {
-			hasReply = true
-		}
 	}
-	return hasReply
+	return true
+}
+
+func emptyAssistantContent(content string, jsonMode bool) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return true
+	}
+	if !jsonMode || !strings.HasPrefix(content, "[") {
+		return false
+	}
+	var items []json.RawMessage
+	return json.Unmarshal([]byte(content), &items) == nil && len(items) == 0
 }
 
 // joinReplyMessages concatenates the messages from reply pseudo-tools,
@@ -419,11 +454,13 @@ func (a *Agent) prospectiveDiff(name string, args json.RawMessage) (text string,
 		}
 		path, whole = a2.Path, a2.Content
 	}
-	p, err := a.tools.ResolvePath(path)
+	// Bound and securely open the old file before constructing preview text.
+	// Reading max+1 distinguishes an oversized file without allocating it all.
+	const maxDiffBytes = 256 * 1024
+	oldData, _, err := a.tools.ReadFileLimited(path, maxDiffBytes)
 	if err != nil {
 		return "", 0, 0, false
 	}
-	oldData, _ := os.ReadFile(p) // missing file => empty (a creation)
 	oldText := string(oldData)
 
 	newText := whole
@@ -437,13 +474,24 @@ func (a *Agent) prospectiveDiff(name string, args json.RawMessage) (text string,
 	if newText == oldText {
 		return "", 0, 0, false
 	}
-	// Bound the O(n*m) line diff: skip the preview for very large files.
-	const maxDiffBytes = 256 * 1024
+	// Bound the O(n*m) line diff: skip the preview for very large files or
+	// pathological many-short-line inputs that would OOM the LCS table.
 	if len(oldText) > maxDiffBytes || len(newText) > maxDiffBytes {
 		return "", 0, 0, false
 	}
-	added, removed = diff.Stat(oldText, newText)
-	return diff.Unified(oldText, newText, 3), added, removed, true
+	if int64(diffLineCount(oldText))*int64(diffLineCount(newText)) > diff.MaxLineProduct {
+		return "", 0, 0, false
+	}
+	lines := diff.Lines(oldText, newText)
+	added, removed := diff.StatLines(lines)
+	return diff.UnifiedLines(lines, 3), added, removed, true
+}
+
+func diffLineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(strings.TrimSuffix(s, "\n"), "\n") + 1
 }
 
 // shortErr collapses an error to a single, length-bounded line so a retry
@@ -499,6 +547,34 @@ func commandArg(args json.RawMessage) string {
 	}
 	_ = json.Unmarshal(args, &a)
 	return a.Command
+}
+
+// maxApprovalCommandBytes caps how much of a run_command string is shown in
+// the approval prompt. Beyond this, a head and visible tail are kept so the
+// operator can still see how the command ends.
+const maxApprovalCommandBytes = 8 * 1024
+
+// approvalCommandLines formats a command for the approval prompt: multiline
+// preserved, capped at maxApprovalCommandBytes with an explicit truncation
+// marker and a visible tail. Line sanitisation is left to the UI.
+func approvalCommandLines(cmd string) []string {
+	cmd = strings.ReplaceAll(cmd, "\r\n", "\n")
+	cmd = strings.ReplaceAll(cmd, "\r", "\n")
+	if len(cmd) > maxApprovalCommandBytes {
+		const tail = 256
+		marker := "\n… (truncated; showing head and tail) …\n"
+		head := maxApprovalCommandBytes - len(marker) - tail
+		if head < 64 {
+			head = 64
+		}
+		if tail+head+len(marker) > len(cmd) {
+			// Degenerate tiny input past the cap: just clip.
+			cmd = cmd[:maxApprovalCommandBytes] + "\n… (truncated)"
+		} else {
+			cmd = cmd[:head] + marker + cmd[len(cmd)-tail:]
+		}
+	}
+	return strings.Split(cmd, "\n")
 }
 
 func toolError(err error) string {

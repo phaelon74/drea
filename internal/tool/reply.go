@@ -10,8 +10,9 @@ import (
 // it and ends the turn instead of dispatching it like a real tool.
 type reply struct{}
 
-func (reply) Name() string   { return "reply" }
-func (reply) Mutating() bool { return false }
+func (reply) Name() string          { return "reply" }
+func (reply) Mutating() bool        { return false }
+func (reply) AlwaysConfirm() bool   { return false }
 func (reply) Run(_ context.Context, _ json.RawMessage) (string, error) {
 	return "", nil
 }

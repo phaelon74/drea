@@ -10,10 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
-	"unsafe"
 )
 
 // ANSI colour codes. Colour is disabled automatically when stdout is not a
@@ -36,32 +33,37 @@ type UI struct {
 	in     *bufio.Reader
 	colour bool
 	tty    bool
-	afilt  streamFilter // sanitises streamed assistant text
 
-	statusMu      sync.Mutex
+	mu            sync.Mutex
+	afilt         streamFilter // sanitises streamed assistant text
 	statusWorkdir string
 	statusUsed    int
 	statusTotal   int
 	statusMsg     string
 	statusShown   bool
+	lineStart     bool // true when the cursor is known to be at the start of a line
+	multiline     bool // when true, Ctrl-D (not Enter) ends ReadInput
 
-	thinkMu     sync.Mutex
-	thinkActive int32
-	thinkStop   chan struct{}
-	thinkDone   chan struct{}
-
-	lineMu    sync.Mutex
-	lineStart bool // true when the cursor is known to be at the start of a line
-
-	multiline bool // when true, Ctrl-D (not Enter) ends ReadInput
+	thinkMu       sync.Mutex
+	thinkActive   bool
+	thinkStopping bool
+	thinkStop     chan struct{}
+	thinkDone     chan struct{}
 }
 
 // New builds a UI writing to stdout and reading from stdin.
 func New() *UI {
-	tty := isTTY()
+	return NewWithIO(os.Stdin, os.Stdout)
+}
+
+// NewWithIO builds a UI around caller-provided streams. Terminal animation and
+// colour remain enabled only when out is the process stdout TTY.
+func NewWithIO(in io.Reader, out io.Writer) *UI {
+	f, isFile := out.(*os.File)
+	tty := isFile && f == os.Stdout && isTTY()
 	return &UI{
-		out:       os.Stdout,
-		in:        bufio.NewReader(os.Stdin),
+		out:       out,
+		in:        bufio.NewReader(in),
 		colour:    tty && !noColor(),
 		tty:       tty,
 		lineStart: true,
@@ -70,19 +72,19 @@ func New() *UI {
 
 // SetStatus configures the context-usage values shown in the bottom bar.
 func (u *UI) SetStatus(used, total int) {
-	u.statusMu.Lock()
+	u.mu.Lock()
 	u.statusUsed = used
 	if total > 0 {
 		u.statusTotal = total
 	}
-	u.statusMu.Unlock()
+	u.mu.Unlock()
 }
 
 // SetStatusWorkdir sets the working directory shown in the bottom bar.
 func (u *UI) SetStatusWorkdir(wd string) {
-	u.statusMu.Lock()
+	u.mu.Lock()
 	u.statusWorkdir = wd
-	u.statusMu.Unlock()
+	u.mu.Unlock()
 }
 
 // ShowStatus draws (or redraws) the bottom status bar. On a non-TTY it does
@@ -92,10 +94,14 @@ func (u *UI) ShowStatus() {
 	if !u.tty {
 		return
 	}
-	u.statusMu.Lock()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.showStatusLocked()
+}
+
+func (u *UI) showStatusLocked() {
 	used, total, wd, msg := u.statusUsed, u.statusTotal, u.statusWorkdir, u.statusMsg
 	u.statusShown = true
-	u.statusMu.Unlock()
 
 	width := termWidth()
 	if total <= 0 {
@@ -120,9 +126,9 @@ func (u *UI) ShowStatus() {
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
 	left := fmt.Sprintf("context %s %5.1f%%", bar, pct)
-	right := wd
+	right := sanitizeLine(wd, 4)
 	if msg != "" {
-		right += " · " + msg
+		right += " · " + sanitizeLine(msg, 4)
 	}
 
 	// Build the line with right-aligned workspace (and optional message).
@@ -139,7 +145,7 @@ func (u *UI) ShowStatus() {
 	}
 
 	fmt.Fprintf(u.out, "\r\033[K%s", u.paint(dim, line))
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // HideStatus clears the bottom status bar and moves the cursor to the start of
@@ -148,25 +154,29 @@ func (u *UI) HideStatus() {
 	if !u.tty {
 		return
 	}
-	u.statusMu.Lock()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.hideStatusLocked()
+}
+
+func (u *UI) hideStatusLocked() {
 	u.statusShown = false
-	u.statusMu.Unlock()
 	fmt.Fprint(u.out, "\r\033[K")
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // StatusShown reports whether the status bar is currently on screen.
 func (u *UI) StatusShown() bool {
-	u.statusMu.Lock()
-	defer u.statusMu.Unlock()
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	return u.statusShown
 }
 
 // SetStatusMessage sets an optional short message shown in the status bar.
 func (u *UI) SetStatusMessage(msg string) {
-	u.statusMu.Lock()
+	u.mu.Lock()
 	u.statusMsg = msg
-	u.statusMu.Unlock()
+	u.mu.Unlock()
 }
 
 // StartThinking shows an animated "thinking" indicator above the status bar.
@@ -183,11 +193,11 @@ func (u *UI) StartThinking() {
 	}
 	u.thinkStop = make(chan struct{})
 	u.thinkDone = make(chan struct{})
+	u.thinkActive = true
 	stop := u.thinkStop
 	done := u.thinkDone
 	u.thinkMu.Unlock()
 
-	atomic.StoreInt32(&u.thinkActive, 1)
 	go u.thinkLoop(stop, done)
 }
 
@@ -198,18 +208,34 @@ func (u *UI) StopThinking() {
 	}
 	u.thinkMu.Lock()
 	stop := u.thinkStop
-	u.thinkStop = nil
-	u.thinkMu.Unlock()
 	if stop == nil {
+		u.thinkMu.Unlock()
 		return
 	}
-	close(stop)
-	<-u.thinkDone
-	atomic.StoreInt32(&u.thinkActive, 0)
+	done := u.thinkDone
+	if !u.thinkStopping {
+		close(stop)
+		u.thinkStopping = true
+	}
+	u.thinkMu.Unlock()
+
+	<-done
+	u.thinkMu.Lock()
+	if u.thinkDone == done {
+		u.thinkStop = nil
+		u.thinkDone = nil
+		u.thinkActive = false
+		u.thinkStopping = false
+	}
+	u.thinkMu.Unlock()
 }
 
 // ThinkingActive reports whether the thinking indicator is running.
-func (u *UI) ThinkingActive() bool { return atomic.LoadInt32(&u.thinkActive) == 1 }
+func (u *UI) ThinkingActive() bool {
+	u.thinkMu.Lock()
+	defer u.thinkMu.Unlock()
+	return u.thinkActive
+}
 
 var thinkFrames = []string{
 	"Drea is thinking",
@@ -239,21 +265,25 @@ func (u *UI) drawThinking(text string) {
 	if !u.tty {
 		return
 	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	width := termWidth()
 	line := u.paint(dim, text)
 	if len([]rune(line)) > width-1 {
 		line = string([]rune(line)[:width-1])
 	}
 	fmt.Fprintf(u.out, "\r\033[K%s", line)
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 func (u *UI) clearThinking() {
 	if !u.tty {
 		return
 	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	fmt.Fprint(u.out, "\r\033[K")
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 func noColor() bool {
@@ -278,6 +308,8 @@ func (u *UI) paint(code, s string) string {
 
 // Banner prints the startup banner with the active model and workdir.
 func (u *UI) Banner(model, workdir string, autoApprove bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	width := termWidth()
 	if width < 40 {
 		width = 40
@@ -290,8 +322,8 @@ func (u *UI) Banner(model, workdir string, autoApprove bool) {
 		title = strings.Repeat("─", left) + title + strings.Repeat("─", right)
 	}
 	fmt.Fprintln(u.out, u.paint(bold+magenta, title))
-	fmt.Fprintln(u.out, u.paint(dim, "  model   ")+model)
-	fmt.Fprintln(u.out, u.paint(dim, "  workdir ")+workdir)
+	fmt.Fprintln(u.out, u.paint(dim, "  model   ")+sanitizeLine(model, 4))
+	fmt.Fprintln(u.out, u.paint(dim, "  workdir ")+sanitizeLine(workdir, 4))
 	mode := "confirm before commands & writes"
 	modeCode := dim
 	if autoApprove {
@@ -300,8 +332,8 @@ func (u *UI) Banner(model, workdir string, autoApprove bool) {
 	}
 	fmt.Fprintln(u.out, u.paint(dim, "  safety  ")+u.paint(modeCode, mode))
 	fmt.Fprintln(u.out)
-	u.SetStatusWorkdir(workdir)
-	u.setLineStart(true)
+	u.statusWorkdir = workdir
+	u.lineStart = true
 }
 
 // Assistant streams a chunk of assistant text. The text originates from the
@@ -311,52 +343,64 @@ func (u *UI) Banner(model, workdir string, autoApprove bool) {
 // Newlines and tabs are preserved. State is carried across chunks so an escape
 // sequence split over a chunk boundary is still neutralised.
 func (u *UI) Assistant(chunk string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	clean := u.afilt.feed(chunk)
 	fmt.Fprint(u.out, clean)
-	if strings.HasSuffix(chunk, "\n") {
-		u.setLineStart(true)
+	if strings.HasSuffix(clean, "\n") {
+		u.lineStart = true
 	} else {
-		u.setLineStart(false)
+		u.lineStart = false
 	}
 }
 
 // AssistantHeader prints the label shown before assistant output and resets the
 // streaming filter for the new block of assistant text.
 func (u *UI) AssistantHeader() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	u.afilt = streamFilter{}
-	u.ensureLineStart()
+	u.ensureLineStartLocked()
 	fmt.Fprintln(u.out, u.paint(bold+cyan, "╭─ assistant"))
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // Println writes a line of output, first hiding the status bar so the line is
-// not appended to it, then restoring the bar.
+// not appended to it, then restoring the bar. Model- or user-influenced text
+// is sanitised so ESC/control sequences cannot corrupt the terminal.
 func (u *UI) Println(s string) {
-	if u.StatusShown() {
-		u.HideStatus()
+	s = sanitizeDisplay(s)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.statusShown {
+		u.hideStatusLocked()
 		fmt.Fprintln(u.out, s)
-		u.ShowStatus()
-		u.setLineStart(true)
+		u.showStatusLocked()
+		u.lineStart = true
 		return
 	}
 	fmt.Fprintln(u.out, s)
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // ToolCall reports a tool invocation the model requested. The summary comes
 // from model-supplied arguments, so it is sanitised to a single safe line.
 func (u *UI) ToolCall(name, summary string) {
-	u.ensureLineStart()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.ensureLineStartLocked()
 	label := u.paint(bold+blue, "├─→ "+name)
 	if summary != "" {
 		label += " " + u.paint(dim, sanitizeLine(summary, 4))
 	}
 	fmt.Fprintln(u.out, label)
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // ToolResult prints a short, indented preview of a tool result.
 func (u *UI) ToolResult(text string, isErr bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	preview := truncate(text, 12, 2000)
 	code := dim
 	if isErr {
@@ -365,7 +409,7 @@ func (u *UI) ToolResult(text string, isErr bool) {
 	for _, line := range strings.Split(preview, "\n") {
 		fmt.Fprintln(u.out, u.paint(code, "│  "+sanitizeLine(line, 4)))
 	}
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // Diff prints a unified diff, colouring added lines green and removed red.
@@ -373,6 +417,8 @@ func (u *UI) Diff(text string) {
 	if text == "" {
 		return
 	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	for _, line := range strings.Split(text, "\n") {
 		code := dim
 		if strings.HasPrefix(line, "+") {
@@ -382,13 +428,14 @@ func (u *UI) Diff(text string) {
 		}
 		fmt.Fprintln(u.out, "│  "+u.paint(code, sanitizeLine(line, 4)))
 	}
-	u.setLineStart(true)
+	u.lineStart = true
 }
 
 // LiveView renders a rolling, in-place tail of streaming text: only the last
 // maxLines lines are shown and the block is redrawn as new text arrives. On a
 // non-TTY writer it renders nothing (the final result is printed elsewhere).
 type LiveView struct {
+	mu       sync.Mutex
 	u        *UI
 	title    string
 	maxLines int
@@ -418,11 +465,15 @@ func (lv *LiveView) Update(full string) {
 	if !lv.u.tty {
 		return
 	}
+	lv.mu.Lock()
+	defer lv.mu.Unlock()
+	lv.u.mu.Lock()
+	defer lv.u.mu.Unlock()
 	width := termWidth()
 	body := lastLines(full, lv.maxLines)
 
 	if !lv.started {
-		lv.u.ensureLineStart()
+		lv.u.ensureLineStartLocked()
 		header := clip(sanitizeLine("┄ "+lv.title, 4), width-3)
 		fmt.Fprintln(lv.u.out, lv.u.paint(dim, "  "+header))
 		lv.started = true
@@ -438,7 +489,7 @@ func (lv *LiveView) Update(full string) {
 		fmt.Fprintln(lv.u.out, lv.u.paint(dim, livePrefix+ln))
 	}
 	lv.prev = len(body)
-	lv.u.setLineStart(true)
+	lv.u.lineStart = true
 }
 
 // Close finishes the view, leaving the last rendered tail in place.
@@ -546,27 +597,42 @@ func clip(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
-// termWidth returns the current terminal width in columns, falling back to 80
-// when it cannot be determined (e.g. output is not a terminal).
-func termWidth() int {
-	var ws struct{ Row, Col, Xpixel, Ypixel uint16 }
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		os.Stdout.Fd(),
-		uintptr(syscall.TIOCGWINSZ),
-		uintptr(unsafe.Pointer(&ws)),
-	)
-	if errno != 0 || ws.Col == 0 {
-		return 80
+// termWidth is defined in term_linux.go / term_other.go.
+
+// Info, Warn and Error print status lines. Content is sanitised before any
+// colour codes are applied so injected ESC sequences cannot survive.
+func (u *UI) Info(s string)  { u.printlnPainted(u.paint(dim, sanitizeDisplay(s))) }
+func (u *UI) Warn(s string)  { u.printlnPainted(u.paint(yellow, sanitizeDisplay(s))) }
+func (u *UI) Error(s string) { u.printlnPainted(u.paint(red, "error: ") + sanitizeDisplay(s)) }
+func (u *UI) Done(s string)  { u.printlnPainted(u.paint(green, sanitizeDisplay(s))) }
+
+// printlnPainted writes an already-coloured line without re-sanitising (which
+// would strip the paint codes). Callers must sanitise untrusted content first.
+func (u *UI) printlnPainted(s string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.statusShown {
+		u.hideStatusLocked()
+		fmt.Fprintln(u.out, s)
+		u.showStatusLocked()
+		u.lineStart = true
+		return
 	}
-	return int(ws.Col)
+	fmt.Fprintln(u.out, s)
+	u.lineStart = true
 }
 
-// Info, Warn and Error print status lines.
-func (u *UI) Info(s string)  { u.Println(u.paint(dim, s)) }
-func (u *UI) Warn(s string)  { u.Println(u.paint(yellow, s)) }
-func (u *UI) Error(s string) { u.Println(u.paint(red, "error: ") + s) }
-func (u *UI) Done(s string)  { u.Println(u.paint(green, s)) }
+// sanitizeDisplay sanitises multiline text line-by-line for terminal display.
+func sanitizeDisplay(s string) string {
+	if s == "" {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = sanitizeLine(ln, 4)
+	}
+	return strings.Join(lines, "\n")
+}
 
 // SetMultiline toggles the input mode. In single-line mode (the default) a
 // single Enter sends the message; in multi-line mode Enter starts a new line
@@ -574,23 +640,31 @@ func (u *UI) Done(s string)  { u.Println(u.paint(green, s)) }
 // pasted code arrives as one message. The prompt glyph reflects the active
 // mode and, in multi-line mode, carries a hint about how to send.
 func (u *UI) SetMultiline(on bool) {
+	u.mu.Lock()
 	u.multiline = on
+	u.mu.Unlock()
 }
 
 // Multiline reports whether multi-line input mode is active.
-func (u *UI) Multiline() bool { return u.multiline }
+func (u *UI) Multiline() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.multiline
+}
 
 // Prompt writes the interactive input prompt (no newline). In multi-line mode
 // the prompt carries a hint that Ctrl-D sends the message, so the user always
 // sees how to submit multi-line input.
 func (u *UI) Prompt() {
-	u.ensureLineStart()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.ensureLineStartLocked()
 	if u.multiline {
 		fmt.Fprint(u.out, u.paint(bold+green, "│─╮ ")+u.paint(dim, "(Ctrl-D to send) "))
 	} else {
 		fmt.Fprint(u.out, u.paint(bold+green, "│─› "))
 	}
-	u.setLineStart(false)
+	u.lineStart = false
 }
 
 // ReadInput reads user input. In single-line mode (the default) the first Enter
@@ -599,7 +673,10 @@ func (u *UI) Prompt() {
 // code arrives as one message. io.EOF is returned when Ctrl-D is pressed on an
 // empty buffer, so callers can exit cleanly.
 func (u *UI) ReadInput() (string, error) {
-	if !u.multiline {
+	u.mu.Lock()
+	multiline := u.multiline
+	u.mu.Unlock()
+	if !multiline {
 		line, err := u.in.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) && strings.TrimRight(line, "\r\n") != "" {
@@ -626,9 +703,11 @@ func (u *UI) ReadInput() (string, error) {
 // Confirm asks a yes/no question, defaulting to no. It returns true only on an
 // explicit affirmative answer.
 func (u *UI) Confirm(question string) bool {
-	u.ensureLineStart()
-	fmt.Fprint(u.out, u.paint(yellow, question)+u.paint(dim, " [y/N] "))
-	u.setLineStart(false)
+	u.mu.Lock()
+	u.ensureLineStartLocked()
+	fmt.Fprint(u.out, u.paint(yellow, sanitizeDisplay(question))+u.paint(dim, " [y/N] "))
+	u.lineStart = false
+	u.mu.Unlock()
 	line, err := u.in.ReadString('\n')
 	if err != nil {
 		return false
@@ -640,19 +719,10 @@ func (u *UI) Confirm(question string) bool {
 	return false
 }
 
-func (u *UI) setLineStart(v bool) {
-	u.lineMu.Lock()
-	u.lineStart = v
-	u.lineMu.Unlock()
-}
-
-func (u *UI) ensureLineStart() {
-	u.lineMu.Lock()
-	start := u.lineStart
-	u.lineMu.Unlock()
-	if !start {
+func (u *UI) ensureLineStartLocked() {
+	if !u.lineStart {
 		fmt.Fprintln(u.out)
-		u.setLineStart(true)
+		u.lineStart = true
 	}
 }
 

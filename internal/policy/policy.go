@@ -36,9 +36,10 @@ func (d Decision) String() string {
 // DefaultDeny is a small, best-effort set of patterns for unambiguously
 // catastrophic commands (wiping the filesystem or home directory, formatting
 // disks, powering off the host, a classic fork bomb). It is always applied in
-// addition to any user-supplied deny patterns. It is intentionally conservative
-// to avoid false positives; real isolation still relies on running the harness
-// with least privilege.
+// addition to any user-supplied deny patterns. It is intentionally incomplete:
+// it catches only a few obvious foot-guns and is easy to bypass with creative
+// spelling or indirection. It is not a sandbox and does not replace least
+// privilege or reviewing what the agent runs.
 var DefaultDeny = []string{
 	// rm -rf (in either flag order) targeting the filesystem root, home, or a
 	// bare glob. Anchored to command position so "rm -rf ./build" is fine.
@@ -95,18 +96,23 @@ func compile(patterns []string) ([]*regexp.Regexp, error) {
 	return out, nil
 }
 
-// Decide classifies a command. Deny takes precedence over allow.
+// Decide classifies a command. Deny takes precedence over allow. Deny rules
+// may match anywhere in the command; allow rules must match the entire
+// trimmed command (a prefix-only hit is treated as Ask so compound suffixes
+// like "; curl …" cannot ride an allowlisted prefix).
 func (p *Policy) Decide(command string) Decision {
 	if p == nil {
 		return Ask
 	}
+	command = strings.TrimSpace(command)
 	for _, re := range p.deny {
 		if re.MatchString(command) {
 			return Deny
 		}
 	}
 	for _, re := range p.allow {
-		if re.MatchString(command) {
+		loc := re.FindStringIndex(command)
+		if loc != nil && loc[0] == 0 && loc[1] == len(command) {
 			return Allow
 		}
 	}

@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -36,54 +37,82 @@ import (
 const version = "v0.1.0-alpha.1"
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "drea: "+err.Error())
 		os.Exit(1)
 	}
 }
 
-func run() error {
+type cliApp struct {
+	args           []string
+	in             io.Reader
+	out            io.Writer
+	errOut         io.Writer
+	loadSaved      func() (config.Saved, error)
+	newUI          func() *ui.UI
+	runOneShot     func(context.Context, *agent.Agent, *config.Config, string) error
+	runInteractive func(<-chan os.Signal, *agent.Agent, *ui.UI, *config.Config, *llm.Client, *tool.Registry, io.Reader, io.Writer) error
+	signals        func() (<-chan os.Signal, func())
+}
+
+func run(args []string, in io.Reader, out, errOut io.Writer) error {
+	a := cliApp{
+		args:      args,
+		in:        in,
+		out:       out,
+		errOut:    errOut,
+		loadSaved: loadSaved,
+		newUI: func() *ui.UI {
+			return ui.NewWithIO(in, out)
+		},
+		runOneShot: func(ctx context.Context, ag *agent.Agent, _ *config.Config, task string) error {
+			return ag.Run(ctx, task)
+		},
+		runInteractive: interactive,
+		signals: func() (<-chan os.Signal, func()) {
+			ch := make(chan os.Signal, 1)
+			signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+			return ch, func() { signal.Stop(ch) }
+		},
+	}
+	return a.run()
+}
+
+func (a cliApp) run() error {
 	// "drea eval <dir>" runs the evaluation harness instead of a task/session.
-	if len(os.Args) > 1 && os.Args[1] == "eval" {
-		return runEval(os.Args[2:])
+	if len(a.args) > 0 && a.args[0] == "eval" {
+		return runEval(a.args[1:], a.errOut, a.newUI)
 	}
 
 	// Handle --version before flag parsing so it works even if config files or
 	// the workspace are missing.
-	for _, a := range os.Args[1:] {
-		if a == "--version" || a == "-v" {
-			fmt.Println("drea " + version)
+	for _, arg := range a.args {
+		if arg == "--version" || arg == "-v" {
+			fmt.Fprintln(a.out, "drea "+version)
 			return nil
 		}
 	}
 
-	saved, _, _ := settings.Load()
-	key, _, _ := settings.LoadKey()
-	cfg := config.Defaults(config.Saved{
-		BaseURL:         saved.BaseURL,
-		APIKey:          key,
-		Model:           saved.Model,
-		Verify:          saved.Verify,
-		VerifyAttempts:  saved.VerifyAttempts,
-		Checkpoint:      saved.Checkpoint,
-		ContextTokens:   saved.ContextTokens,
-		JSONFormat:      saved.JSONFormat,
-		TopP:            saved.TopP,
-		ReasoningEffort: saved.ReasoningEffort,
-		AllowCommands:   saved.AllowCommands,
-		DenyCommands:    saved.DenyCommands,
-	})
+	saved, err := a.loadSaved()
+	if err != nil {
+		return err
+	}
+	cfg := config.Defaults(saved)
 
 	var resume bool
 	fs := flag.NewFlagSet("drea", flag.ContinueOnError)
+	fs.SetOutput(a.errOut)
 	fs.Var((*stringList)(&cfg.AllowCommands), "allow", "regex for a run_command command to auto-run without a prompt (repeatable)")
 	fs.Var((*stringList)(&cfg.DenyCommands), "deny", "regex for a run_command command to block outright (repeatable)")
+	fs.Var((*stringList)(&cfg.PassEnv), "pass-env", "credential-like env var name to pass through to child processes (repeatable; never DREA_API_KEY/OPENAI_API_KEY)")
 	fs.StringVar(&cfg.Debug, "debug", cfg.Debug, "dump raw request/response traffic to a file (for debugging)")
 	fs.StringVar(&cfg.BaseURL, "base-url", cfg.BaseURL, "OpenAI-compatible API base URL")
 	fs.StringVar(&cfg.Model, "model", cfg.Model, "model name")
 	fs.StringVar(&cfg.APIKey, "key", cfg.APIKey, "API key (prefer DREA_API_KEY env var)")
 	fs.StringVar(&cfg.Workdir, "workdir", cfg.Workdir, "workspace root the agent is confined to")
 	fs.BoolVar(&cfg.AutoApprove, "auto", cfg.AutoApprove, "auto-approve commands and file writes (no confirmation)")
+	fs.BoolVar(&cfg.AllowInsecureKeyTransport, "allow-insecure-key-transport", cfg.AllowInsecureKeyTransport, "allow sending the API key over plain HTTP (including loopback)")
+	fs.BoolVar(&cfg.AllowExternalDebugLog, "allow-external-debug-log", cfg.AllowExternalDebugLog, "allow --debug paths outside the workspace (log contains raw prompts and tool data)")
 	fs.IntVar(&cfg.MaxSteps, "max-steps", cfg.MaxSteps, "maximum model turns per task")
 	fs.Float64Var(&cfg.Temperature, "temperature", cfg.Temperature, "sampling temperature")
 	fs.Float64Var(&cfg.TopP, "top-p", cfg.TopP, "nucleus-sampling probability")
@@ -100,30 +129,44 @@ func run() error {
 	fs.BoolVar(&cfg.Persist, "persist", cfg.Persist, "save the conversation transcript so it can be resumed (never stores the API key)")
 	fs.BoolVar(&resume, "resume", false, "resume the most recent saved session for this workspace")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: drea [flags] [task...]")
-		fmt.Fprintln(os.Stderr, "       drea eval <dir>   run the evaluation harness over task specs in <dir>")
-		fmt.Fprintln(os.Stderr, "\nRun a task once by passing it as arguments, or omit it for an interactive session.")
-		fmt.Fprintln(os.Stderr, "\nFlags:")
+		fmt.Fprintln(a.errOut, "Usage: drea [flags] [task...]")
+		fmt.Fprintln(a.errOut, "       drea eval <dir>   run the evaluation harness over task specs in <dir>")
+		fmt.Fprintln(a.errOut, "\nRun a task once by passing it as arguments, or omit it for an interactive session.")
+		fmt.Fprintln(a.errOut, "\nFlags:")
 		fs.PrintDefaults()
-		fmt.Fprintln(os.Stderr, "\nEnvironment: DREA_BASE_URL, DREA_API_KEY (or OPENAI_API_KEY), DREA_MODEL, DREA_WORKDIR,")
-		fmt.Fprintln(os.Stderr, "             DREA_AUTO_APPROVE, DREA_VERIFY, DREA_VERIFY_ATTEMPTS, DREA_CHECKPOINT,")
-		fmt.Fprintln(os.Stderr, "             DREA_CONTEXT_TOKENS, DREA_NO_PERSIST, DREA_JSON_FORMAT, DREA_DEBUG,")
-		fmt.Fprintln(os.Stderr, "             DREA_ALLOW_COMMANDS, DREA_DENY_COMMANDS (newline-separated regexes),")
-		fmt.Fprintln(os.Stderr, "             DREA_REASONING_EFFORT")
+		fmt.Fprintln(a.errOut, "\nEnvironment: DREA_BASE_URL, DREA_API_KEY (or OPENAI_API_KEY), DREA_MODEL, DREA_WORKDIR,")
+		fmt.Fprintln(a.errOut, "             DREA_AUTO_APPROVE, DREA_VERIFY, DREA_VERIFY_ATTEMPTS, DREA_CHECKPOINT,")
+		fmt.Fprintln(a.errOut, "             DREA_CONTEXT_TOKENS, DREA_NO_PERSIST, DREA_JSON_FORMAT, DREA_DEBUG,")
+		fmt.Fprintln(a.errOut, "             DREA_ALLOW_COMMANDS, DREA_DENY_COMMANDS (newline-separated regexes),")
+		fmt.Fprintln(a.errOut, "             DREA_TEMPERATURE, DREA_TOP_P, DREA_REASONING_EFFORT")
 	}
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(a.args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
 	}
 
+	keyFromFlag := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "key" {
+			keyFromFlag = true
+		}
+	})
+
 	cfg.JSONMode = !noJSONMode
 	if err := cfg.Normalize(); err != nil {
 		return err
 	}
+	tool.SetPassEnv(cfg.PassEnv)
 
-	u := ui.New()
+	u := a.newUI()
+	if keyFromFlag {
+		u.Warn("--key puts the API key in process argv (visible to ps and shell history); prefer DREA_API_KEY")
+	}
+	if cfg.AllowExternalDebugLog && cfg.Debug != "" {
+		u.Warn("--allow-external-debug-log: debug file may leave the workspace and contains raw prompts, replies, and tool data")
+	}
 
 	// Isolation is set up before anything else looks at Workdir: the tools, the
 	// agent and the session file must all agree on where the work happens.
@@ -142,7 +185,9 @@ func run() error {
 	}
 
 	client := llm.NewClientWithReasoning(cfg.ChatURL(), cfg.APIKey, cfg.Model, cfg.Temperature, cfg.TopP, cfg.ReasoningEffort, cfg.RequestTimeout, cfg.JSONMode, cfg.JSONFormat)
-	client.SetDebug(cfg.Debug)
+	if err := client.SetDebug(cfg.Debug); err != nil {
+		return fmt.Errorf("open debug log: %w", err)
+	}
 	tools := tool.NewRegistry(cfg.Workdir)
 	ag := agent.New(cfg, client, tools, u)
 	objective = ag.Objective
@@ -158,9 +203,8 @@ func run() error {
 	// A single, long-lived signal channel. Each task derives a fresh context
 	// cancelled by the next signal, so Ctrl-C aborts the in-flight task
 	// without killing the process or poisoning later tasks.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
+	sigCh, stopSignals := a.signals()
+	defer stopSignals()
 
 	u.Banner(cfg.Model, cfg.Workdir, cfg.AutoApprove)
 	u.SetStatus(0, cfg.ContextTokens)
@@ -170,9 +214,9 @@ func run() error {
 	if task := strings.TrimSpace(strings.Join(fs.Args(), " ")); task != "" {
 		ctx, cancel := taskContext(sigCh)
 		defer cancel()
-		return ag.Run(ctx, task)
+		return a.runOneShot(ctx, ag, &cfg, task)
 	}
-	return interactive(sigCh, ag, u, &cfg, client, tools)
+	return a.runInteractive(sigCh, ag, u, &cfg, client, tools, a.in, a.out)
 }
 
 // taskContext returns a context cancelled when the first signal arrives on
@@ -191,13 +235,14 @@ func taskContext(sigCh <-chan os.Signal) (context.Context, context.CancelFunc) {
 }
 
 // interactive runs a read-eval loop, keeping conversation context across turns.
-func interactive(sigCh <-chan os.Signal, ag *agent.Agent, u *ui.UI, cfg *config.Config, client *llm.Client, tools *tool.Registry) error {
+func interactive(sigCh <-chan os.Signal, ag *agent.Agent, u *ui.UI, cfg *config.Config, client *llm.Client, tools *tool.Registry, in io.Reader, out io.Writer) error {
+	reader := bufio.NewReader(in)
 	u.Info("Interactive session. Type a task, /help for commands, or Ctrl-D to quit.")
 	for {
 		u.Prompt()
-		line, err := u.ReadInput()
+		line, err := readInput(reader, u.Multiline())
 		if errors.Is(err, io.EOF) {
-			fmt.Println()
+			fmt.Fprintln(out)
 			return nil
 		}
 		if err != nil {
@@ -232,6 +277,28 @@ func interactive(sigCh <-chan os.Signal, ag *agent.Agent, u *ui.UI, cfg *config.
 	}
 }
 
+func readInput(in *bufio.Reader, multiline bool) (string, error) {
+	if !multiline {
+		line, err := in.ReadString('\n')
+		line = strings.TrimRight(line, "\r\n")
+		if errors.Is(err, io.EOF) && line != "" {
+			return line, nil
+		}
+		return line, err
+	}
+	var b strings.Builder
+	for {
+		line, err := in.ReadString('\n')
+		b.WriteString(line)
+		if err != nil {
+			if b.Len() > 0 {
+				return strings.TrimRight(b.String(), "\r\n"), nil
+			}
+			return "", err
+		}
+	}
+}
+
 // command handles slash commands and the bare exit/quit words. It returns true
 // when the session should end.
 func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client *llm.Client, tools *tool.Registry) bool {
@@ -261,8 +328,10 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 			u.Info("host: " + cfg.BaseURL)
 			break
 		}
+		prev := cfg.BaseURL
 		cfg.BaseURL = arg
 		if err := cfg.Normalize(); err != nil {
+			cfg.BaseURL = prev
 			u.Error(err.Error())
 			break
 		}
@@ -272,8 +341,10 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 		switch arg {
 		case "on", "true", "yes":
 			cfg.AutoApprove = true
+			ag.SetAutoApprove(true)
 		case "off", "false", "no":
 			cfg.AutoApprove = false
+			ag.SetAutoApprove(false)
 		case "":
 		default:
 			u.Warn("usage: /auto [on|off]")
@@ -290,10 +361,12 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 		}
 		if arg == "off" || arg == "none" {
 			cfg.Verify = ""
+			ag.SetVerify("")
 			u.Info("verify command cleared")
 			break
 		}
 		cfg.Verify = arg
+		ag.SetVerify(arg)
 		u.Info("verify command set to: " + arg)
 	case "multiline":
 		switch arg {
@@ -312,8 +385,10 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 		switch arg {
 		case "on", "true", "yes":
 			cfg.Checkpoint = true
+			ag.SetCheckpoint(true)
 		case "off", "false", "no":
 			cfg.Checkpoint = false
+			ag.SetCheckpoint(false)
 		case "":
 		default:
 			u.Warn("usage: /checkpoint [on|off]")
@@ -357,7 +432,13 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 			u.Info("key cleared")
 			break
 		}
+		prev := cfg.APIKey
 		cfg.APIKey = arg
+		if err := cfg.Normalize(); err != nil {
+			cfg.APIKey = prev
+			u.Error(err.Error())
+			break
+		}
 		client.SetAPIKey(arg)
 		u.Info("key set")
 	case "save":
@@ -369,6 +450,7 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 			Checkpoint:      cfg.Checkpoint,
 			ContextTokens:   cfg.ContextTokens,
 			JSONFormat:      cfg.JSONFormat,
+			Temperature:     cfg.Temperature,
 			TopP:            cfg.TopP,
 			ReasoningEffort: cfg.ReasoningEffort,
 			AllowCommands:   cfg.AllowCommands,
@@ -386,7 +468,10 @@ func command(line string, u *ui.UI, ag *agent.Agent, cfg *config.Config, client 
 		u.Info("saved settings to " + p)
 		u.Info("saved API key to " + kp)
 	case "resume":
-		if s, ok, _ := session.Load(cfg.Workdir); ok && ag.Restore(s.Messages) {
+		s, ok, err := session.Load(cfg.Workdir)
+		if err != nil {
+			u.Error("load session: " + err.Error())
+		} else if ok && ag.Restore(s.Messages) {
 			u.Info(fmt.Sprintf("resumed session (%d messages)", ag.MessageCount()))
 		} else {
 			u.Warn("no saved session found for this workspace")
@@ -413,7 +498,7 @@ const helpText = `commands:
   /multiline [on|off]  toggle multi-line input (Enter starts a new line; Ctrl-D sends)
   /usage          show token usage for this session
   /policy         show the run_command allow/deny policy
-  /save           persist model + host + verify + policy + API key to the settings file
+  /save           persist model + host + sampling + verify + policy + reasoning + API key
   /resume         reload the saved transcript for this workspace
   /reset          clear the conversation history
   /tools          list available tools
@@ -437,6 +522,7 @@ func showConfig(u *ui.UI, cfg *config.Config) {
 	u.Info(fmt.Sprintf("context:  %d tokens", cfg.ContextTokens))
 	u.Info(fmt.Sprintf("persist:  %v", cfg.Persist))
 	u.Info(fmt.Sprintf("json:     %s (mode: %v)", cfg.JSONFormat, cfg.JSONMode))
+	u.Info(fmt.Sprintf("temp:     %v", cfg.Temperature))
 	u.Info(fmt.Sprintf("top-p:    %v", cfg.TopP))
 	reasoning := cfg.ReasoningEffort
 	if reasoning == "" {
@@ -445,6 +531,13 @@ func showConfig(u *ui.UI, cfg *config.Config) {
 	u.Info(fmt.Sprintf("reasoning: %s", reasoning))
 	u.Info(fmt.Sprintf("allow:    %d pattern(s)", len(cfg.AllowCommands)))
 	u.Info(fmt.Sprintf("deny:     %d pattern(s) (+ built-in)", len(cfg.DenyCommands)))
+	u.Info(fmt.Sprintf("pass-env: %d variable(s)", len(cfg.PassEnv)))
+	u.Info(fmt.Sprintf("insecure-key-transport: %v", cfg.AllowInsecureKeyTransport))
+	if cfg.Debug == "" {
+		u.Info("debug:    (off)")
+	} else {
+		u.Info(fmt.Sprintf("debug:    %s (external allowed: %v)", cfg.Debug, cfg.AllowExternalDebugLog))
+	}
 	u.Info(fmt.Sprintf("key:      %s", maskKey(cfg.APIKey)))
 	u.Info(fmt.Sprintf("settings: %s", p))
 }

@@ -273,14 +273,14 @@ func TestGitInspectNormalizesShellStyleAction(t *testing.T) {
 func TestValidRef(t *testing.T) {
 	ok := []string{"HEAD", "main", "abc123", "HEAD~2", "v1.0.0"}
 	for _, r := range ok {
-		if err := validRef(r); err != nil {
-			t.Errorf("validRef(%q) unexpected error: %v", r, err)
+		if err := vcs.ValidRef(r); err != nil {
+			t.Errorf("vcs.ValidRef(%q) unexpected error: %v", r, err)
 		}
 	}
 	bad := []string{"-f", "--hard", "a b", "a;rm", "a`x`", "a$(x)", "a|b"}
 	for _, r := range bad {
-		if err := validRef(r); err == nil {
-			t.Errorf("validRef(%q) expected error", r)
+		if err := vcs.ValidRef(r); err == nil {
+			t.Errorf("vcs.ValidRef(%q) expected error", r)
 		}
 	}
 }
@@ -291,5 +291,46 @@ func TestGitRollbackRejectsBadRef(t *testing.T) {
 	_, err := rb.Run(context.Background(), mustJSON(t, map[string]string{"ref": "--hard"}))
 	if err == nil {
 		t.Fatal("expected error for flag-like ref")
+	}
+}
+
+func TestGitInitAllowsNestedWorkspace(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	parent := initRepo(t)
+	nested := filepath.Join(parent, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Nested dir is inside a work tree but is not a repo root.
+	rd := &gitRead{root: nested}
+	if _, err := rd.Run(ctx, mustJSON(t, map[string]string{"action": "status"})); err == nil {
+		t.Fatal("git_inspect in a nested workspace must refuse the parent repo")
+	}
+
+	init := &gitInit{root: nested}
+	out, err := init.Run(ctx, nil)
+	if err != nil {
+		t.Fatalf("git_init in nested workspace: %v", err)
+	}
+	if !strings.Contains(out, "initialized") {
+		t.Fatalf("expected nested init, got %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(nested, ".git")); err != nil {
+		t.Fatalf("expected nested .git: %v", err)
+	}
+
+	// Parent sibling must remain untouched by nested commits.
+	if err := os.WriteFile(filepath.Join(nested, "x.txt"), []byte("nested\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&gitCommit{root: nested}).Run(ctx, mustJSON(t, map[string]string{"message": "nested"})); err != nil {
+		t.Fatalf("nested commit: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "x.txt")); !os.IsNotExist(err) {
+		t.Fatal("nested commit must not create files in the parent worktree")
 	}
 }

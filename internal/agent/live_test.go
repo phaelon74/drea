@@ -1,6 +1,9 @@
 package agent
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestStreamingFieldPartial(t *testing.T) {
 	// Arguments arrive fragment by fragment; content should decode as far as
@@ -44,5 +47,21 @@ func TestStreamingFieldUnicode(t *testing.T) {
 	got, ok := streamingField(`{"content":"caf\u00e9"}`, "content")
 	if !ok || got != "café" {
 		t.Fatalf("content = %q ok=%v, want café", got, ok)
+	}
+}
+
+func TestLiveWritesBoundsBuffer(t *testing.T) {
+	l := newLiveWrites(nil, nil, nil)
+	// A non-previewed tool still accumulates args; the buffer must stay capped.
+	l.onName(0, "run_command")
+	chunk := strings.Repeat("x", 8192)
+	for i := 0; i < 40; i++ {
+		l.onArgs(0, chunk)
+	}
+	if l.bufs[0] == nil {
+		t.Fatal("expected a buffer")
+	}
+	if l.bufs[0].Len() > maxLiveBufBytes {
+		t.Fatalf("buffer length %d exceeds cap %d", l.bufs[0].Len(), maxLiveBufBytes)
 	}
 }

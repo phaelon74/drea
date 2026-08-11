@@ -94,16 +94,6 @@ func stripCodeFence(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// parseToolCallFromText recovers a single tool call from plain text. It is a
-// thin wrapper around parseToolCallsFromText for callers that only need one.
-func parseToolCallFromText(content string) (llm.ToolCall, bool) {
-	calls, ok := parseToolCallsFromText(content)
-	if !ok || len(calls) == 0 {
-		return llm.ToolCall{}, false
-	}
-	return calls[0], true
-}
-
 // firstString returns the first non-empty string value among the given keys.
 func firstString(obj map[string]json.RawMessage, keys ...string) string {
 	for _, k := range keys {

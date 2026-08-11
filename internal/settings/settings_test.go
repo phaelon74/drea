@@ -10,7 +10,13 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
 
-	p, err := Save(Settings{BaseURL: "https://example.com/v1", Model: "m1", ReasoningEffort: "medium"})
+	p, err := Save(Settings{
+		BaseURL:         "https://example.com/v1",
+		Model:           "m1",
+		Temperature:     0.2,
+		TopP:            0.8,
+		ReasoningEffort: "medium",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +39,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("ok = false, want true")
 	}
-	if got.BaseURL != "https://example.com/v1" || got.Model != "m1" || got.ReasoningEffort != "medium" {
+	if got.BaseURL != "https://example.com/v1" || got.Model != "m1" ||
+		got.Temperature != 0.2 || got.TopP != 0.8 || got.ReasoningEffort != "medium" {
 		t.Fatalf("loaded %+v", got)
 	}
 }
@@ -154,5 +161,67 @@ func TestSaveKeyEmptyRemovesFile(t *testing.T) {
 	}
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Fatalf("blank key file should be removed, stat err = %v", err)
+	}
+}
+
+func TestSaveRepairsPermissiveKeyAndSettings(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	cfg := filepath.Join(dir, "drea")
+	if err := os.MkdirAll(cfg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(cfg, "key")
+	settingsPath := filepath.Join(cfg, "settings.json")
+	if err := os.WriteFile(keyPath, []byte("sk-old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveKey("sk-new"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Save(Settings{Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{keyPath, settingsPath} {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("%s perm = %o, want 600", p, perm)
+		}
+	}
+}
+
+func TestLoadRejectsOversizedSettings(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p := filepath.Join(dir, "drea", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, make([]byte, maxSize+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(); err == nil {
+		t.Fatal("expected oversized settings to be rejected")
+	}
+}
+
+func TestLoadKeyRejectsOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	p := filepath.Join(dir, "drea", "key")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, make([]byte, maxKeySize+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadKey(); err == nil {
+		t.Fatal("expected oversized key file to be rejected")
 	}
 }

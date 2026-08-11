@@ -20,6 +20,10 @@ type liveWrites struct {
 	ensureNL func()
 }
 
+// maxLiveBufBytes caps the raw argument buffer kept per live write preview.
+// Only the tail is retained once the cap is hit.
+const maxLiveBufBytes = 256 << 10
+
 func newLiveWrites(u *ui.UI, tools *tool.Registry, ensureNL func()) *liveWrites {
 	return &liveWrites{
 		ui:       u,
@@ -40,6 +44,11 @@ func (l *liveWrites) onArgs(index int, fragment string) {
 		l.bufs[index] = b
 	}
 	b.WriteString(fragment)
+	if b.Len() > maxLiveBufBytes {
+		tail := b.String()[b.Len()-maxLiveBufBytes:]
+		b.Reset()
+		b.WriteString(tail)
+	}
 
 	var field, verb string
 	switch l.names[index] {

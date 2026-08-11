@@ -326,3 +326,44 @@ func TestAddWorktreeNeedsARepositoryWithCommits(t *testing.T) {
 		t.Fatalf("expected a 'no commits' error, got %v", err)
 	}
 }
+
+func TestRequireRepoRootRejectsNestedDir(t *testing.T) {
+	ctx := context.Background()
+	dir := repo(t)
+	nested := filepath.Join(dir, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireRepoRoot(ctx, nested); err == nil {
+		t.Fatal("expected nested directory to be rejected")
+	}
+	if err := RequireRepoRoot(ctx, dir); err != nil {
+		t.Fatalf("repo root should be accepted: %v", err)
+	}
+	if IsRepoRoot(ctx, nested) {
+		t.Fatal("nested directory must not be reported as a repo root")
+	}
+	if !IsRepoRoot(ctx, dir) {
+		t.Fatal("repo root should be reported as a repo root")
+	}
+}
+
+func TestNestedWorkspaceCannotMutateParent(t *testing.T) {
+	ctx := context.Background()
+	parent := repo(t)
+	write(t, parent, "sibling.txt", "parent sibling\n")
+	nested := filepath.Join(parent, "ws")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Checkpoint(ctx, nested, "should fail"); err == nil {
+		t.Fatal("checkpoint in a nested workspace must fail")
+	}
+	if err := Restore(ctx, nested, "HEAD"); err == nil {
+		t.Fatal("restore in a nested workspace must fail")
+	}
+	got, err := os.ReadFile(filepath.Join(parent, "sibling.txt"))
+	if err != nil || string(got) != "parent sibling\n" {
+		t.Fatalf("parent sibling must be untouched: %q %v", got, err)
+	}
+}

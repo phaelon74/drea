@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,28 +42,44 @@ type Client struct {
 	// reasoningEffort is the reasoning effort level forwarded to the endpoint.
 	// Empty means omit from the request so the endpoint default is used.
 	reasoningEffort string
-	// debug, when non-empty, is the path to append raw request/response traffic
-	// to for inspection.
-	debug string
+	// debug receives raw request/response traffic. It is opened once with
+	// no-follow semantics so a later path replacement cannot redirect logs.
+	debug   *os.File
+	debugMu sync.Mutex
+	// rng supplies jitter for retry backoff. Seeded per client so Go 1.19
+	// (which does not auto-seed math/rand) still varies delays. Guarded by
+	// rngMu because Stream may be called from more than one place.
+	rng   *rand.Rand
+	rngMu sync.Mutex
 }
 
-// NewClient constructs a client. timeout bounds a single request (including
-// the full streamed body). jsonMode, when set, asks the endpoint to constrain
-// output to a strict JSON schema describing a tool call. jsonFormat selects
-// the response_format variant to send (json_schema or json_object).
+// StreamOpts controls per-request behaviour without mutating the Client.
+type StreamOpts struct {
+	// DisableResponseFormat omits response_format even when the client is in
+	// JSON mode. Compaction uses this so summaries are plain text.
+	DisableResponseFormat bool
+	// DisableJSONModeParse treats streamed content as ordinary prose rather
+	// than a JSON tool-call serialization.
+	DisableJSONModeParse bool
+}
+
+// NewClient constructs a client. timeout bounds each HTTP attempt, including
+// its streamed body. jsonMode asks the endpoint to constrain output to a tool
+// call schema; jsonFormat selects json_schema (the default) or json_object.
 func NewClient(chatURL, apiKey, model string, temperature float64, timeout time.Duration, jsonMode bool, jsonFormat string) *Client {
-	return NewClientWithTopP(chatURL, apiKey, model, temperature, 0.95, timeout, jsonMode, jsonFormat)
-}
-
-// NewClientWithTopP constructs a client with explicit top-p nucleus sampling.
-// The supplied topP value is always forwarded in requests.
-func NewClientWithTopP(chatURL, apiKey, model string, temperature, topP float64, timeout time.Duration, jsonMode bool, jsonFormat string) *Client {
-	return NewClientWithReasoning(chatURL, apiKey, model, temperature, topP, "", timeout, jsonMode, jsonFormat)
+	return NewClientWithReasoning(chatURL, apiKey, model, temperature, 0, "", timeout, jsonMode, jsonFormat)
 }
 
 // NewClientWithReasoning constructs a client with explicit top-p and reasoning
 // effort. The supplied reasoningEffort value is forwarded only when non-empty.
 func NewClientWithReasoning(chatURL, apiKey, model string, temperature, topP float64, reasoningEffort string, timeout time.Duration, jsonMode bool, jsonFormat string) *Client {
+	return newClientWithSource(chatURL, apiKey, model, temperature, topP, reasoningEffort, timeout, jsonMode, jsonFormat, rand.NewSource(time.Now().UnixNano()))
+}
+
+// newClientWithSource is the deterministic construction seam used by tests.
+// The source remains private because callers do not otherwise need to control
+// retry jitter.
+func newClientWithSource(chatURL, apiKey, model string, temperature, topP float64, reasoningEffort string, timeout time.Duration, jsonMode bool, jsonFormat string, source rand.Source) *Client {
 	if jsonFormat == "" {
 		jsonFormat = "json_schema"
 	}
@@ -78,6 +95,7 @@ func NewClientWithReasoning(chatURL, apiKey, model string, temperature, topP flo
 		http:            &http.Client{Timeout: timeout},
 		maxRetries:      5,
 		baseDelay:       time.Second,
+		rng:             rand.New(source),
 	}
 }
 
@@ -116,8 +134,25 @@ func (c *Client) SetReasoningEffort(level string) { c.reasoningEffort = level }
 // SetAPIKey changes the API key used for subsequent requests.
 func (c *Client) SetAPIKey(key string) { c.apiKey = key }
 
-// SetDebug enables raw request/response dumping to the given path.
-func (c *Client) SetDebug(path string) { c.debug = path }
+// SetDebug enables raw request/response dumping to path. The file is opened
+// once with append and no-follow semantics and repaired to mode 0600.
+func (c *Client) SetDebug(path string) error {
+	c.debugMu.Lock()
+	defer c.debugMu.Unlock()
+	if c.debug != nil {
+		_ = c.debug.Close()
+		c.debug = nil
+	}
+	if path == "" {
+		return nil
+	}
+	f, err := openDebugAppend(path)
+	if err != nil {
+		return err
+	}
+	c.debug = f
+	return nil
+}
 
 // Stream sends the conversation and tool definitions, invoking h's callbacks
 // as content and tool-call fragments arrive. Tool-call fragments are also
@@ -129,6 +164,12 @@ func (c *Client) SetDebug(path string) { c.debug = path }
 // longer aborts the task. Handlers are invoked only once the chosen attempt
 // starts streaming, so retries never double up output.
 func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, h Handlers) (*Result, error) {
+	return c.StreamWithOptions(ctx, messages, tools, h, StreamOpts{})
+}
+
+// StreamWithOptions is Stream with per-request options. Compaction uses it to
+// disable response_format while leaving the client's global JSON mode alone.
+func (c *Client) StreamWithOptions(ctx context.Context, messages []Message, tools []Tool, h Handlers, opts StreamOpts) (*Result, error) {
 	body := request{
 		Model:           c.model,
 		Messages:        messages,
@@ -138,8 +179,10 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, h
 		Stream:          true,
 		StreamOptions:   &streamOptions{IncludeUsage: true},
 	}
-	body.TopP = c.topP
-	if c.jsonMode {
+	if c.topP > 0 {
+		body.TopP = &c.topP
+	}
+	if c.jsonMode && !opts.DisableResponseFormat {
 		body.ResponseFormat = toolCallResponseFormat(c.jsonFormat)
 	}
 	raw, err := json.Marshal(body)
@@ -148,30 +191,36 @@ func (c *Client) Stream(ctx context.Context, messages []Message, tools []Tool, h
 	}
 
 	c.debugWrite("REQUEST\n" + string(raw) + "\n\n")
+	var attempts int
 	for attempt := 0; ; attempt++ {
-		res, transient, ra, err := c.attempt(ctx, raw, h)
+		attempts++
+		res, transient, ra, err := c.attempt(ctx, raw, h, opts)
+		if res == nil {
+			res = &Result{}
+		}
+		res.Attempts = attempts
 		if err == nil {
 			return res, nil
 		}
 		if !transient || ctx.Err() != nil {
-			return nil, err
+			return res, err
 		}
 		if attempt == c.maxRetries {
-			return nil, fmt.Errorf("giving up after %d attempts: %w", c.maxRetries+1, err)
+			return res, fmt.Errorf("giving up after %d attempts: %w", c.maxRetries+1, err)
 		}
 		delay := c.backoff(attempt+1, ra)
 		if h.OnRetry != nil {
 			h.OnRetry(attempt+1, delay, err)
 		}
 		if err := sleep(ctx, delay); err != nil {
-			return nil, err
+			return res, err
 		}
 	}
 }
 
 // attempt performs a single request. transient reports whether a returned
 // error is worth retrying; ra carries any Retry-After hint from the server.
-func (c *Client) attempt(ctx context.Context, raw []byte, h Handlers) (res *Result, transient bool, ra time.Duration, err error) {
+func (c *Client) attempt(ctx context.Context, raw []byte, h Handlers, opts StreamOpts) (res *Result, transient bool, ra time.Duration, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(raw))
 	if err != nil {
 		return nil, false, 0, err
@@ -203,7 +252,7 @@ func (c *Client) attempt(ctx context.Context, raw []byte, h Handlers) (res *Resu
 
 	// Success: stream the body. A mid-stream failure is not retried because
 	// partial output has already been delivered to the handlers.
-	res, err = c.consume(resp.Body, h)
+	res, err = c.consume(resp.Body, h, opts)
 	resp.Body.Close()
 	return res, false, 0, err
 }
@@ -246,7 +295,10 @@ func (c *Client) backoff(attempt int, retryAfter time.Duration) time.Duration {
 	if d > maxDelay || d <= 0 {
 		d = maxDelay
 	}
-	return d/2 + time.Duration(rand.Int63n(int64(d/2)+1))
+	c.rngMu.Lock()
+	n := c.rng.Int63n(int64(d/2) + 1)
+	c.rngMu.Unlock()
+	return d/2 + time.Duration(n)
 }
 
 // parseRetryAfter interprets a Retry-After header, which may be either a number
@@ -273,15 +325,12 @@ func parseRetryAfter(v string) time.Duration {
 // sleep waits for d or until ctx is cancelled, whichever comes first.
 // debugWrite appends text to the debug log when debugging is enabled.
 func (c *Client) debugWrite(text string) {
-	if c.debug == "" {
+	c.debugMu.Lock()
+	defer c.debugMu.Unlock()
+	if c.debug == nil {
 		return
 	}
-	f, err := os.OpenFile(c.debug, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	f.WriteString(text)
+	_, _ = c.debug.WriteString(text)
 }
 
 // teeReader returns a reader that copies everything read into the debug log.
@@ -289,16 +338,16 @@ func (c *Client) teeReader(r io.Reader) io.Reader {
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
-		f, err := os.OpenFile(c.debug, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
+		c.debugMu.Lock()
+		defer c.debugMu.Unlock()
+		if c.debug == nil {
 			io.Copy(pw, r)
 			return
 		}
-		defer f.Close()
-		f.WriteString("RESPONSE\n")
-		mw := io.MultiWriter(pw, f)
+		_, _ = c.debug.WriteString("RESPONSE\n")
+		mw := io.MultiWriter(pw, c.debug)
 		io.Copy(mw, r)
-		f.WriteString("\n\n")
+		_, _ = c.debug.WriteString("\n\n")
 	}()
 	return pr
 }
@@ -320,20 +369,30 @@ func sleep(ctx context.Context, d time.Duration) error {
 // consume reads the SSE stream line-by-line, merging content and tool-call
 // deltas into a single Result. It is tolerant of blank lines, comments and
 // non-JSON frames so no token is ever dropped on a well-formed stream.
-func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
-	if c.debug != "" {
+func (c *Client) consume(r io.Reader, h Handlers, opts StreamOpts) (*Result, error) {
+	c.debugMu.Lock()
+	debugging := c.debug != nil
+	c.debugMu.Unlock()
+	if debugging {
 		r = c.teeReader(r)
 	}
 	res := &Result{}
 	// tool calls accumulated by their stream index.
 	acc := map[int]*ToolCall{}
 	var order []int
+	parseJSON := c.jsonMode && !opts.DisableJSONModeParse
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	var totalSSE int
+	var totalToolArgs int
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		totalSSE += len(line) + 1
+		if totalSSE > maxStreamSSEBytes {
+			return res, fmt.Errorf("SSE stream exceeds %d byte limit", maxStreamSSEBytes)
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue // skip comments / event: lines / blanks
 		}
@@ -357,12 +416,15 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 		}
 		choice := chunk.Choices[0]
 		if choice.Delta.Content != "" {
+			if len(res.Content)+len(choice.Delta.Content) > maxStreamContent {
+				return res, fmt.Errorf("stream content exceeds %d byte limit", maxStreamContent)
+			}
 			res.Content += choice.Delta.Content
 			// In JSON mode the content is a serialization of tool calls, not
 			// prose meant for the user. Suppress live printing; it will be
 			// parsed into tool calls at the end, or released as prose if parsing
 			// fails.
-			if h.OnContent != nil && !c.jsonMode {
+			if h.OnContent != nil && !parseJSON {
 				h.OnContent(choice.Delta.Content)
 			}
 		}
@@ -371,7 +433,7 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 		// Reconstruct tool calls incrementally so the caller can dispatch them
 		// as soon as the stream ends, rather than waiting for a finish_reason
 		// that may never arrive.
-		if c.jsonMode && res.Content != "" && len(res.ToolCalls) == 0 {
+		if parseJSON && res.Content != "" && len(res.ToolCalls) == 0 {
 			if tcs, ok := parseJSONModeToolCalls(res.Content); ok {
 				res.ToolCalls = tcs
 			}
@@ -379,6 +441,9 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 		for _, tc := range choice.Delta.ToolCalls {
 			cur, ok := acc[tc.Index]
 			if !ok {
+				if len(order) >= maxStreamToolCalls {
+					return res, fmt.Errorf("stream exceeds %d tool call limit", maxStreamToolCalls)
+				}
 				cur = &ToolCall{Type: "function"}
 				acc[tc.Index] = cur
 				order = append(order, tc.Index)
@@ -397,6 +462,13 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 				}
 			}
 			if tc.Function.Arguments != "" {
+				if len(cur.Function.Arguments)+len(tc.Function.Arguments) > maxStreamToolArgs {
+					return res, fmt.Errorf("tool call arguments exceed %d byte limit", maxStreamToolArgs)
+				}
+				if len(tc.Function.Arguments) > maxStreamTotalToolArgs-totalToolArgs {
+					return res, fmt.Errorf("aggregate tool call arguments exceed %d byte limit", maxStreamTotalToolArgs)
+				}
+				totalToolArgs += len(tc.Function.Arguments)
 				cur.Function.Arguments += tc.Function.Arguments
 				if h.OnToolArgs != nil {
 					h.OnToolArgs(tc.Index, tc.Function.Arguments)
@@ -407,7 +479,7 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 		// plain content deltas with no tool_calls array. Reconstruct the tool
 		// calls from the accumulated content so downstream code always sees
 		// native tool calls.
-		if c.jsonMode && res.Content != "" && len(res.ToolCalls) == 0 && choice.FinishReason != "" {
+		if parseJSON && res.Content != "" && len(res.ToolCalls) == 0 && choice.FinishReason != "" {
 			if tcs, ok := parseJSONModeToolCalls(res.Content); ok {
 				res.ToolCalls = tcs
 			}
@@ -417,7 +489,7 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return res, err
 	}
 
 	for _, idx := range order {
@@ -426,17 +498,22 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 	// If the endpoint streamed JSON-mode content as plain deltas, the
 	// per-chunk reconstruction above may already have populated ToolCalls.
 	// Make sure it is also reflected in the accumulated result.
-	if c.jsonMode && res.Content != "" && len(res.ToolCalls) == 0 {
+	if parseJSON && res.Content != "" && len(res.ToolCalls) == 0 {
 		if tcs, ok := parseJSONModeToolCalls(res.Content); ok {
 			res.ToolCalls = tcs
 		}
 	}
-	// If every parsed tool call is a non-empty "reply" pseudo-tool, treat the
-	// whole turn as plain assistant prose so the agent stops and shows it to the
-	// user. Empty replies are dropped so a confused model cannot stall the task
-	// by emitting vacuous "[]" turns.
+	if err := validateToolArguments(res.ToolCalls); err != nil {
+		return res, err
+	}
+	if parseJSON && len(res.ToolCalls) == 0 && isEmptyJSONModeArray(res.Content) {
+		res.Content = ""
+	}
+	// If every parsed tool call is a "reply" pseudo-tool, convert its non-empty
+	// messages to prose. An all-empty set becomes an empty turn for the agent's
+	// bounded correction path.
 	released := false
-	if c.jsonMode && len(res.ToolCalls) > 0 {
+	if parseJSON && len(res.ToolCalls) > 0 {
 		allReply := true
 		for _, tc := range res.ToolCalls {
 			if !IsReplyCall(tc) {
@@ -466,14 +543,39 @@ func (c *Client) consume(r io.Reader, h Handlers) (*Result, error) {
 	}
 	// JSON mode content that could not be parsed as tool calls is ordinary
 	// assistant prose; release it now so the caller can display it.
-	if c.jsonMode && res.Content != "" && len(res.ToolCalls) == 0 && !released {
+	if parseJSON && res.Content != "" && len(res.ToolCalls) == 0 && !released {
 		if h.OnContent != nil {
 			h.OnContent(res.Content)
 		}
-	} else if c.jsonMode && !released {
+	} else if parseJSON && !released {
 		// The content was a tool-call serialization; do not leave it in the
 		// assistant message or the model will see its own JSON schema output.
 		res.Content = ""
 	}
 	return res, nil
 }
+
+func validateToolArguments(calls []ToolCall) error {
+	total := 0
+	for _, tc := range calls {
+		n := len(tc.Function.Arguments)
+		if n > maxStreamToolArgs {
+			return fmt.Errorf("tool call arguments exceed %d byte limit", maxStreamToolArgs)
+		}
+		if n > maxStreamTotalToolArgs-total {
+			return fmt.Errorf("aggregate tool call arguments exceed %d byte limit", maxStreamTotalToolArgs)
+		}
+		total += n
+	}
+	return nil
+}
+
+// Bounds on what a single streamed completion may accumulate. Without them a
+// runaway endpoint could exhaust memory before the request timeout fires.
+const (
+	maxStreamContent       = 4 << 20 // 4 MiB of assistant content
+	maxStreamToolArgs      = 2 << 20 // 2 MiB of arguments per tool call
+	maxStreamTotalToolArgs = 4 << 20 // 4 MiB across all tool calls
+	maxStreamToolCalls     = 64
+	maxStreamSSEBytes      = 16 << 20 // 16 MiB aggregate SSE payload
+)

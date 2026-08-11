@@ -66,6 +66,9 @@ type Result struct {
 	ToolCalls    []ToolCall
 	FinishReason string
 	Usage        Usage
+	// Attempts is how many HTTP requests were made for this completion,
+	// including retries and a terminal failure.
+	Attempts int
 }
 
 // request is the JSON body sent to /chat/completions.
@@ -74,7 +77,7 @@ type request struct {
 	Messages        []Message       `json:"messages"`
 	Tools           []Tool          `json:"tools,omitempty"`
 	Temperature     float64         `json:"temperature"`
-	TopP            float64         `json:"top_p"`
+	TopP            *float64        `json:"top_p,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 	Stream          bool            `json:"stream"`
 	StreamOptions   *streamOptions  `json:"stream_options,omitempty"`
@@ -219,6 +222,15 @@ func parseJSONModeToolCalls(content string) ([]ToolCall, bool) {
 		calls = append(calls, ToolCall{Type: "function", Function: FunctionCall{Name: obj.Name, Arguments: args}})
 	}
 	return calls, len(calls) > 0
+}
+
+func isEmptyJSONModeArray(content string) bool {
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, "[") {
+		return false
+	}
+	var items []json.RawMessage
+	return json.Unmarshal([]byte(content), &items) == nil && len(items) == 0
 }
 
 // IsReplyCall reports whether a tool call is the special "reply" pseudo-tool

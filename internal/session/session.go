@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -68,13 +69,7 @@ func Save(s Session) error {
 	if err != nil {
 		return err
 	}
-	// Write to a temp file and rename so a crash mid-write cannot leave a
-	// truncated, unparseable transcript behind.
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
+	return writePrivate(p, data)
 }
 
 // Load reads the transcript for a workspace root. A missing file returns
@@ -94,12 +89,53 @@ func Load(workdir string) (Session, bool, error) {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxSize))
+	data, err := io.ReadAll(io.LimitReader(f, maxSize+1))
 	if err != nil {
 		return s, false, err
+	}
+	if len(data) > maxSize {
+		return s, false, fmt.Errorf("session file exceeds %d byte limit", maxSize)
 	}
 	if err := json.Unmarshal(data, &s); err != nil {
 		return s, false, err
 	}
 	return s, true, nil
+}
+
+// writePrivate writes data via a temp file with 0600 mode, then renames into
+// place. It also Chmods the final path so a pre-existing permissive file is
+// repaired.
+func writePrivate(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".drea-session-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return os.Chmod(path, 0o600)
 }

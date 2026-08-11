@@ -30,6 +30,21 @@ func TestResolveConfinement(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsAbsolutePath(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(inside, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := resolve(root, inside)
+	if err == nil {
+		t.Fatal("expected absolute path to be rejected")
+	}
+	if !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("error should mention relative paths, got %v", err)
+	}
+}
+
 func TestResolveRejectsSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -130,6 +145,73 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+func TestSearchSkipsSymlinkToOutside(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := "TOPSECRET_UNIQUE_MARKER"
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte(secret+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ok.txt"), []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &search{root: root}
+	out, err := run(t, s, map[string]any{"pattern": "TOPSECRET|safe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, secret) {
+		t.Fatalf("search leaked symlink target content: %q", out)
+	}
+	if !strings.Contains(out, "ok.txt") {
+		t.Fatalf("expected in-workspace match, got %q", out)
+	}
+}
+
+func TestSearchLineLengthLimit(t *testing.T) {
+	root := t.TempDir()
+	exact := strings.Repeat("x", maxSearchLineBytes)
+	if err := os.WriteFile(filepath.Join(root, "exact.txt"), []byte(exact+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, &search{root: root}, map[string]any{"pattern": "^x+$", "path": "exact.txt"})
+	if err != nil {
+		t.Fatalf("exact-limit line rejected: %v", err)
+	}
+	if !strings.Contains(out, "exact.txt:1:") {
+		t.Fatalf("exact-limit line not matched: %q", out)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "over.txt"), []byte(strings.Repeat("x", maxSearchLineBytes+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, &search{root: root}, map[string]any{"pattern": "x", "path": "over.txt"}); err == nil {
+		t.Fatal("expected one-over-limit line to be rejected")
+	}
+}
+
+func TestSearchManyShortLines(t *testing.T) {
+	root := t.TempDir()
+	var content strings.Builder
+	for i := 0; i < 50000; i++ {
+		content.WriteString("short\n")
+	}
+	content.WriteString("unique-marker\n")
+	if err := os.WriteFile(filepath.Join(root, "many.txt"), []byte(content.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, &search{root: root}, map[string]any{"pattern": "unique-marker"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "many.txt:50001:unique-marker") {
+		t.Fatalf("final short-line match missing: %q", out)
+	}
+}
+
 func TestRunCommand(t *testing.T) {
 	root := t.TempDir()
 	rc := &runCommand{root: root}
@@ -170,6 +252,9 @@ func TestReplyTool(t *testing.T) {
 	if tool.Mutating() {
 		t.Error("reply tool should not be mutating")
 	}
+	if tool.AlwaysConfirm() {
+		t.Error("reply tool should not always confirm")
+	}
 	out, err := run(t, tool, map[string]any{"message": "hello"})
 	if err != nil {
 		t.Fatal(err)
@@ -182,5 +267,93 @@ func TestReplyTool(t *testing.T) {
 	}
 	if got := tool.Summary(json.RawMessage(`{}`)); got != "(no message)" {
 		t.Errorf("empty summary = %q, want (no message)", got)
+	}
+}
+
+func TestGitRollbackAlwaysConfirm(t *testing.T) {
+	r := NewRegistry(t.TempDir())
+	rb, ok := r.Get("git_rollback")
+	if !ok {
+		t.Fatal("git_rollback not registered")
+	}
+	if !rb.AlwaysConfirm() {
+		t.Fatal("git_rollback must AlwaysConfirm")
+	}
+	// Decision logic used by agent.dispatch: AlwaysConfirm wins over AutoApprove.
+	autoApprove := true
+	requireApproval := (rb.Mutating() && !autoApprove) || rb.AlwaysConfirm()
+	if !requireApproval {
+		t.Fatal("git_rollback must prompt even when AutoApprove is true")
+	}
+	wc, ok := r.Get("write_file")
+	if !ok {
+		t.Fatal("write_file not registered")
+	}
+	if wc.AlwaysConfirm() {
+		t.Fatal("write_file must not AlwaysConfirm")
+	}
+	requireApproval = (wc.Mutating() && !autoApprove) || wc.AlwaysConfirm()
+	if requireApproval {
+		t.Fatal("write_file should not require approval when AutoApprove is true")
+	}
+}
+
+func TestScrubEnvRemovesAPIKey(t *testing.T) {
+	t.Setenv("DREA_API_KEY", "secret-should-not-leak")
+	t.Setenv("OPENAI_API_KEY", "openai-should-not-leak")
+	root := t.TempDir()
+	rc := &runCommand{root: root}
+	out, err := run(t, rc, map[string]any{"command": "printenv DREA_API_KEY; printenv OPENAI_API_KEY; true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "secret-should-not-leak") || strings.Contains(out, "openai-should-not-leak") {
+		t.Fatalf("API key leaked into child env: %q", out)
+	}
+}
+
+func TestPassEnvAllowsListedButNotAPIKeys(t *testing.T) {
+	t.Setenv("GH_TOKEN", "gh-pass-through")
+	t.Setenv("DREA_API_KEY", "drea-never")
+	SetPassEnv([]string{"GH_TOKEN", "DREA_API_KEY"})
+	defer SetPassEnv(nil)
+
+	root := t.TempDir()
+	rc := &runCommand{root: root}
+	out, err := run(t, rc, map[string]any{"command": "printenv GH_TOKEN; printenv DREA_API_KEY; true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "gh-pass-through") {
+		t.Fatalf("expected GH_TOKEN to pass through, got %q", out)
+	}
+	if strings.Contains(out, "drea-never") {
+		t.Fatalf("DREA_API_KEY must never pass through, got %q", out)
+	}
+}
+
+func TestRegistryReadFileLimitedBoundsAndRejectsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	registry := NewRegistry(root)
+	if err := os.WriteFile(filepath.Join(root, "large.txt"), []byte("12345"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, exists, err := registry.ReadFileLimited("large.txt", 3)
+	if err != nil || !exists || string(data) != "1234" {
+		t.Fatalf("limited read = %q exists=%v err=%v", data, exists, err)
+	}
+	if data, exists, err := registry.ReadFileLimited("missing.txt", 3); err != nil || exists || data != nil {
+		t.Fatalf("missing read = %q exists=%v err=%v", data, exists, err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link.txt")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, _, err := registry.ReadFileLimited("link.txt", 100); err == nil {
+		t.Fatal("expected symlink read rejection")
 	}
 }

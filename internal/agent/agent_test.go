@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -175,6 +176,117 @@ func TestShortErrStripsControl(t *testing.T) {
 	}
 	if !strings.Contains(got, "alert") || !strings.Contains(got, "rate limited") {
 		t.Errorf("shortErr dropped visible text: %q", got)
+	}
+}
+
+func TestApprovalCommandLines(t *testing.T) {
+	lines := approvalCommandLines("echo one\necho two")
+	if len(lines) != 2 || lines[0] != "echo one" || lines[1] != "echo two" {
+		t.Fatalf("multiline = %#v", lines)
+	}
+	big := strings.Repeat("A", maxApprovalCommandBytes+500) + "TAILMARK"
+	out := strings.Join(approvalCommandLines(big), "\n")
+	if !strings.Contains(out, "truncated") {
+		t.Fatalf("expected truncation marker in %q", out[:80])
+	}
+	if !strings.Contains(out, "TAILMARK") {
+		t.Fatal("expected visible tail after truncation")
+	}
+	if strings.HasPrefix(out, strings.Repeat("A", 100)) == false {
+		t.Fatal("expected visible head after truncation")
+	}
+}
+
+func TestDispatchApprovalMatrix(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Defaults(config.Saved{})
+	cfg.Workdir = root
+	cfg.Persist = false
+	cfg.AllowCommands = []string{`^true$`}
+	cfg.DenyCommands = []string{`^false$`}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	ag := New(cfg, nil, tool.NewRegistry(root), ui.New())
+
+	var confirms int
+	ag.confirm = func(string) bool {
+		confirms++
+		return false
+	}
+
+	// User denial blocks a normal mutation.
+	write := llm.ToolCall{Function: llm.FunctionCall{
+		Name:      "write_file",
+		Arguments: `{"path":"denied.txt","content":"no"}`,
+	}}
+	if got := ag.dispatch(context.Background(), write); !strings.Contains(got, "denied") {
+		t.Fatalf("denial result = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "denied.txt")); !os.IsNotExist(err) {
+		t.Fatalf("denied write reached filesystem: %v", err)
+	}
+
+	// Turning auto off affects the very next dispatch.
+	ag.SetAutoApprove(true)
+	ag.SetAutoApprove(false)
+	ag.dispatch(context.Background(), write)
+	if confirms != 2 {
+		t.Fatalf("next dispatch did not prompt after SetAutoApprove(false): %d confirmations", confirms)
+	}
+
+	// Destructive rollback always confirms even under auto approval.
+	ag.SetAutoApprove(true)
+	rollback := llm.ToolCall{Function: llm.FunctionCall{
+		Name:      "git_rollback",
+		Arguments: `{"ref":"HEAD"}`,
+	}}
+	if got := ag.dispatch(context.Background(), rollback); !strings.Contains(got, "denied") {
+		t.Fatalf("rollback denial result = %q", got)
+	}
+	if confirms != 3 {
+		t.Fatalf("rollback under auto did not confirm: %d confirmations", confirms)
+	}
+
+	// Deny policy takes precedence and never asks.
+	deniedCommand := llm.ToolCall{Function: llm.FunctionCall{
+		Name:      "run_command",
+		Arguments: `{"command":"false"}`,
+	}}
+	if got := ag.dispatch(context.Background(), deniedCommand); !strings.Contains(got, "blocked") {
+		t.Fatalf("deny result = %q", got)
+	}
+	if confirms != 3 {
+		t.Fatalf("deny policy unexpectedly prompted: %d confirmations", confirms)
+	}
+
+	if runtime.GOOS == "linux" {
+		// A full-command allow match bypasses normal approval.
+		allowed := llm.ToolCall{Function: llm.FunctionCall{
+			Name:      "run_command",
+			Arguments: `{"command":"true"}`,
+		}}
+		if got := ag.dispatch(context.Background(), allowed); strings.Contains(got, "denied") || strings.Contains(got, "blocked") {
+			t.Fatalf("allow result = %q", got)
+		}
+		if confirms != 3 {
+			t.Fatalf("allow policy unexpectedly prompted: %d confirmations", confirms)
+		}
+	}
+}
+
+func TestDiffLineCountMatchesDiffSplitting(t *testing.T) {
+	tests := map[string]int{
+		"":       0,
+		"a":      1,
+		"a\n":    1,
+		"a\n\n":  2,
+		"a\nb\n": 2,
+	}
+	for input, want := range tests {
+		if got := diffLineCount(input); got != want {
+			t.Errorf("diffLineCount(%q) = %d, want %d", input, got, want)
+		}
 	}
 }
 

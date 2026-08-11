@@ -46,13 +46,15 @@ func runGit(ctx context.Context, root string, args ...string) (string, error) {
 // are shared with it so the tools and the harness can never disagree about
 // whether a workspace is a repository or how a commit is made.
 
-// ensureRepo returns an actionable error when root is not a git work tree. It
-// names the tool that fixes it: pointing the model at a shell command would
-// push it out of the git tools entirely, losing the approval prompts and
-// argument validation they provide.
+// ensureRepo returns an actionable error when root is not exactly a git
+// repository root. Requiring the toplevel (not merely "inside a work tree")
+// stops a nested workspace from running git against a parent repository.
 func ensureRepo(ctx context.Context, root string) error {
-	if !vcs.IsRepo(ctx, root) {
-		return errors.New("not a git repository; use the git_init tool to create one")
+	if err := vcs.RequireRepoRoot(ctx, root); err != nil {
+		if strings.Contains(err.Error(), "not a git repository") {
+			return errors.New("not a git repository; use the git_init tool to create one")
+		}
+		return err
 	}
 	return nil
 }
@@ -65,8 +67,9 @@ func ensureRepo(ctx context.Context, root string) error {
 
 type gitRead struct{ root string }
 
-func (t *gitRead) Name() string   { return "git_inspect" }
-func (t *gitRead) Mutating() bool { return false }
+func (t *gitRead) Name() string        { return "git_inspect" }
+func (t *gitRead) Mutating() bool      { return false }
+func (t *gitRead) AlwaysConfirm() bool { return false }
 func (t *gitRead) Description() string {
 	return "Inspect the workspace git repository (read-only); use this instead of running git through run_command. action is one of: status (short status), diff (unstaged changes; optional 'path' or staged=true), log (recent commits; optional 'limit'), show (a commit or ref given as 'ref'). Use this to understand what has changed before committing or rolling back."
 }
@@ -142,7 +145,7 @@ func (t *gitRead) Run(ctx context.Context, args json.RawMessage) (string, error)
 		if ref == "" {
 			ref = "HEAD"
 		}
-		if err := validRef(ref); err != nil {
+		if err := vcs.ValidRef(ref); err != nil {
 			return "", err
 		}
 		if !vcs.HasCommits(ctx, t.root) {
@@ -158,8 +161,9 @@ func (t *gitRead) Run(ctx context.Context, args json.RawMessage) (string, error)
 
 type gitCommit struct{ root string }
 
-func (t *gitCommit) Name() string   { return "git_commit" }
-func (t *gitCommit) Mutating() bool { return true }
+func (t *gitCommit) Name() string        { return "git_commit" }
+func (t *gitCommit) Mutating() bool      { return true }
+func (t *gitCommit) AlwaysConfirm() bool { return false }
 func (t *gitCommit) Description() string {
 	return "Stage changes and create a commit in the workspace repository. By default stages all changes (tracked and untracked); pass 'paths' to stage only those. A commit is a checkpoint you can later roll back to with git_rollback. 'message' is required."
 }
@@ -233,8 +237,9 @@ func (t *gitCommit) Run(ctx context.Context, args json.RawMessage) (string, erro
 
 type gitInit struct{ root string }
 
-func (t *gitInit) Name() string   { return "git_init" }
-func (t *gitInit) Mutating() bool { return true }
+func (t *gitInit) Name() string        { return "git_init" }
+func (t *gitInit) Mutating() bool      { return true }
+func (t *gitInit) AlwaysConfirm() bool { return false }
 func (t *gitInit) Description() string {
 	return "Create a git repository in the workspace so work can be checkpointed and rolled back. Use this at the start of a task when the workspace is not yet under version control; it is safe to call when it already is (it reports that and changes nothing). Follow it with git_commit to record a baseline."
 }
@@ -243,10 +248,10 @@ func (t *gitInit) Schema() json.RawMessage {
 }
 func (t *gitInit) Summary(json.RawMessage) string { return "git init" }
 func (t *gitInit) Run(ctx context.Context, _ json.RawMessage) (string, error) {
-	// Idempotent: re-initialising an existing repository is harmless but
-	// confusing, and this also covers a workspace nested in a larger repo,
-	// where creating a second repository would be actively wrong.
-	if vcs.IsRepo(ctx, t.root) {
+	// Idempotent for an actual repository root. A workspace that merely sits
+	// inside a parent repository is allowed to create its own nested repo so
+	// git operations stay confined to the workspace.
+	if vcs.IsRepoRoot(ctx, t.root) {
 		return "already a git repository; nothing to do", nil
 	}
 	if _, err := runGit(ctx, t.root, "init"); err != nil {
@@ -259,8 +264,9 @@ func (t *gitInit) Run(ctx context.Context, _ json.RawMessage) (string, error) {
 
 type gitRollback struct{ root string }
 
-func (t *gitRollback) Name() string   { return "git_rollback" }
-func (t *gitRollback) Mutating() bool { return true }
+func (t *gitRollback) Name() string        { return "git_rollback" }
+func (t *gitRollback) Mutating() bool      { return true }
+func (t *gitRollback) AlwaysConfirm() bool { return true }
 func (t *gitRollback) Description() string {
 	return "Restore the workspace to a previous committed state, discarding uncommitted changes to tracked files (git reset --hard). Use this to undo a change that made things worse. 'ref' defaults to HEAD (discard uncommitted work); pass a commit hash or ref to return to an earlier checkpoint. Untracked files are left in place unless clean=true. This is destructive and always requires approval."
 }
@@ -304,7 +310,7 @@ func (t *gitRollback) Run(ctx context.Context, args json.RawMessage) (string, er
 	if ref == "" {
 		ref = "HEAD"
 	}
-	if err := validRef(ref); err != nil {
+	if err := vcs.ValidRef(ref); err != nil {
 		return "", err
 	}
 	if !vcs.HasCommits(ctx, t.root) {
@@ -332,19 +338,6 @@ func normalizeAction(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.TrimSpace(strings.TrimPrefix(s, "git "))
 	return s
-}
-
-// validRef rejects ref values that look like option flags or contain shell/argv
-// metacharacters, as a defence-in-depth check even though args are passed as an
-// explicit argv (never through a shell).
-func validRef(ref string) error {
-	if strings.HasPrefix(ref, "-") {
-		return fmt.Errorf("invalid ref %q", ref)
-	}
-	if strings.ContainsAny(ref, " \t\n;|&$`\\\"'") {
-		return fmt.Errorf("invalid ref %q", ref)
-	}
-	return nil
 }
 
 func nonEmpty(s, whenEmpty string) string {

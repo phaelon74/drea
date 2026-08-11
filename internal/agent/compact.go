@@ -93,8 +93,17 @@ func (a *Agent) summarize(ctx context.Context, msgs []llm.Message) string {
 		{Role: llm.RoleSystem, Content: "You compress an AI coding agent's prior context. Summarize the conversation below into concise but complete notes an engineer could use to continue the task: the goal, key decisions, files created or modified, commands run and their outcomes, the current state, and the next steps. Be factual and terse; preserve concrete names, paths and errors. Do not invent anything."},
 		{Role: llm.RoleUser, Content: transcript},
 	}
-	res, err := a.client.Stream(ctx, req, nil, llm.Handlers{})
-	if err != nil || strings.TrimSpace(res.Content) == "" {
+	res, err := a.client.StreamWithOptions(ctx, req, nil, llm.Handlers{}, llm.StreamOpts{
+		DisableResponseFormat: true,
+		DisableJSONModeParse:  true,
+	})
+	if res != nil {
+		a.task, a.total = a.task.add(res.Usage, res.Attempts), a.total.add(res.Usage, res.Attempts)
+		if res.Usage.PromptTokens > 0 {
+			a.lastPromptTokens = res.Usage.PromptTokens
+		}
+	}
+	if err != nil || res == nil || strings.TrimSpace(res.Content) == "" {
 		return transcript
 	}
 	return strings.TrimSpace(res.Content)

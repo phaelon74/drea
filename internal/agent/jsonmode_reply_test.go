@@ -234,11 +234,9 @@ func TestJSONModeEmptyReplyDoesNotStall(t *testing.T) {
 	}
 }
 
-// TestJSONModeEmptyArrayOnSecondTurnIsNotSwallowed verifies that if the model
-// emits a bare [] on a follow-up turn, the harness does not record an empty
-// assistant message and stall. The schema now forbids empty arrays, but the
-// client also treats them as ordinary prose so the user sees what happened.
-func TestJSONModeEmptyArrayOnSecondTurnIsNotSwallowed(t *testing.T) {
+// TestJSONModeEmptyArrayGetsOneNudge verifies a bare [] receives exactly one
+// corrective turn instead of being accepted as prose.
+func TestJSONModeEmptyArrayGetsOneNudge(t *testing.T) {
 	root := t.TempDir()
 
 	var turn int
@@ -254,6 +252,11 @@ func TestJSONModeEmptyArrayOnSecondTurnIsNotSwallowed(t *testing.T) {
 		case 2:
 			fmt.Fprint(w, sse(
 				`{"choices":[{"delta":{"content":"[]"}}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			))
+		case 3:
+			fmt.Fprint(w, sse(
+				`{"choices":[{"delta":{"content":"[{\"name\":\"reply\",\"arguments\":{\"message\":\"Recovered.\"}}]"}}]}`,
 				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
 			))
 		default:
@@ -279,8 +282,11 @@ func TestJSONModeEmptyArrayOnSecondTurnIsNotSwallowed(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if turn != 3 {
+		t.Fatalf("expected one corrective turn, got %d total turns", turn)
+	}
 	last := ag.messages[len(ag.messages)-1]
-	if last.Role != llm.RoleAssistant || last.Content != "[]" {
-		t.Fatalf("expected assistant message preserving the bare [] as prose, got %+v", last)
+	if last.Role != llm.RoleAssistant || last.Content != "Recovered." {
+		t.Fatalf("expected recovered assistant reply, got %+v", last)
 	}
 }

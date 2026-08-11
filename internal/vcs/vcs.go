@@ -9,19 +9,21 @@
 package vcs
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	dreaprocess "github.com/dreaagent/drea/internal/process"
 )
 
 // timeout bounds any single git invocation the harness makes on its own
 // initiative. These are all metadata operations, so a generous bound still
 // catches a hung command.
-const timeout = 60 * time.Second
+var commandTimeout = 60 * time.Second
 
 // maxOutput caps what is read from git, so a pathological repository cannot
 // make the harness buffer an unbounded amount of memory.
@@ -30,22 +32,24 @@ const maxOutput = 64 << 10
 // run executes `git -C dir args…` and returns its trimmed combined output.
 // A non-zero exit is returned as an error with the output attached.
 func run(ctx context.Context, dir string, args ...string) (string, error) {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, "git", append([]string{"-C", dir}, args...)...)
-	var buf bytes.Buffer
-	w := &capped{buf: &buf, limit: maxOutput}
-	cmd.Stdout, cmd.Stderr = w, w
-
-	err := cmd.Run()
-	out := strings.TrimSpace(buf.String())
-	if cctx.Err() != nil {
+	argv := append([]string{"git", "-C", dir}, args...)
+	result := dreaprocess.Run(ctx, dir, argv, commandTimeout, maxOutput)
+	if !result.Started {
+		return "", fmt.Errorf("git %s: %w", args[0], result.Err)
+	}
+	out := strings.TrimSpace(result.Output)
+	if result.Truncated {
+		out += "\n… (output truncated)"
+	}
+	if result.TimedOut {
 		return out, fmt.Errorf("git %s: timed out", args[0])
 	}
-	if err != nil {
+	if result.Err != nil {
+		if ctx.Err() != nil {
+			return out, fmt.Errorf("git %s: %w", args[0], ctx.Err())
+		}
 		if out == "" {
-			return "", fmt.Errorf("git %s: %w", args[0], err)
+			return "", fmt.Errorf("git %s: %w", args[0], result.Err)
 		}
 		return "", fmt.Errorf("git %s: %s", args[0], firstLine(out))
 	}
@@ -63,6 +67,74 @@ func ok(ctx context.Context, dir string, args ...string) bool {
 func IsRepo(ctx context.Context, dir string) bool {
 	out, err := run(ctx, dir, "rev-parse", "--is-inside-work-tree")
 	return err == nil && strings.TrimSpace(out) == "true"
+}
+
+// RepoRoot returns the canonical absolute path of the repository toplevel that
+// contains dir (git rev-parse --show-toplevel), after Abs and EvalSymlinks.
+func RepoRoot(ctx context.Context, dir string) (string, error) {
+	out, err := run(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(strings.TrimSpace(out))
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return filepath.Clean(abs), nil
+	}
+	return filepath.Clean(real), nil
+}
+
+// canonicalize returns an absolute, symlink-resolved, cleaned path for dir.
+func canonicalize(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return filepath.Clean(abs), nil
+	}
+	return filepath.Clean(real), nil
+}
+
+// RequireRepoRoot errors unless dir is exactly the repository toplevel. This
+// stops a nested workspace from running git against a parent repository (and
+// mutating sibling paths outside the workspace).
+func RequireRepoRoot(ctx context.Context, dir string) error {
+	root, err := RepoRoot(ctx, dir)
+	if err != nil {
+		return errors.New("not a git repository")
+	}
+	here, err := canonicalize(dir)
+	if err != nil {
+		return err
+	}
+	if here != root {
+		return fmt.Errorf("workspace is not the repository root (repository is %s); refuse to run git against a parent repository", root)
+	}
+	return nil
+}
+
+// IsRepoRoot reports whether dir itself is a git repository root: it has a
+// .git entry, or its show-toplevel equals dir. Unlike IsRepo, a subdirectory
+// of another repository is not treated as a root — so git init may create a
+// nested repository there.
+func IsRepoRoot(ctx context.Context, dir string) bool {
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+		return true
+	}
+	root, err := RepoRoot(ctx, dir)
+	if err != nil {
+		return false
+	}
+	here, err := canonicalize(dir)
+	if err != nil {
+		return false
+	}
+	return here == root
 }
 
 // HasCommits reports whether the repository has at least one commit. A freshly
@@ -123,8 +195,8 @@ func Dirty(ctx context.Context, dir string) (bool, error) {
 // current HEAD, so callers always get a ref they can roll back to. Repositories
 // with no commits at all are checkpointed by creating the first one.
 func Checkpoint(ctx context.Context, dir, message string) (ref string, committed bool, err error) {
-	if !IsRepo(ctx, dir) {
-		return "", false, errors.New("not a git repository")
+	if err := RequireRepoRoot(ctx, dir); err != nil {
+		return "", false, err
 	}
 	dirty, err := Dirty(ctx, dir)
 	if err != nil {
@@ -155,6 +227,9 @@ func Checkpoint(ctx context.Context, dir, message string) (ref string, committed
 // Checkpoint had already committed are therefore never lost, and ignored files
 // (build output, caches) are left alone.
 func Restore(ctx context.Context, dir, ref string) error {
+	if err := RequireRepoRoot(ctx, dir); err != nil {
+		return err
+	}
 	if err := ValidRef(ref); err != nil {
 		return err
 	}
@@ -174,6 +249,9 @@ func Restore(ctx context.Context, dir, ref string) error {
 // nothing to keep. If the attempt cannot be preserved, nothing is rolled back —
 // failing loudly is better than quietly destroying the work this exists to save.
 func Rollback(ctx context.Context, dir, ref, branch string) (attempt string, preserved bool, err error) {
+	if err := RequireRepoRoot(ctx, dir); err != nil {
+		return "", false, err
+	}
 	if err := ValidRef(ref); err != nil {
 		return "", false, err
 	}
@@ -262,8 +340,8 @@ type Worktree struct {
 // at all.
 func AddWorktree(ctx context.Context, repo, path, branch string) (Worktree, error) {
 	w := Worktree{Repo: repo, Path: path, Branch: branch}
-	if !IsRepo(ctx, repo) {
-		return w, errors.New("not a git repository")
+	if err := RequireRepoRoot(ctx, repo); err != nil {
+		return w, err
 	}
 	if !HasCommits(ctx, repo) {
 		return w, errors.New("repository has no commits yet; commit a baseline first")
@@ -310,22 +388,6 @@ func (w Worktree) Remove(ctx context.Context) error {
 	}
 	_, err := run(ctx, w.Repo, "branch", "-d", w.Branch)
 	return err
-}
-
-// capped is an io.Writer that stops accumulating after limit bytes.
-type capped struct {
-	buf   *bytes.Buffer
-	limit int
-}
-
-func (c *capped) Write(p []byte) (int, error) {
-	if n := c.limit - c.buf.Len(); n > 0 {
-		if len(p) > n {
-			p = p[:n]
-		}
-		c.buf.Write(p)
-	}
-	return len(p), nil // always report full consumption so git is not told to stop
 }
 
 func firstLine(s string) string {

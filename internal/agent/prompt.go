@@ -14,7 +14,10 @@ import (
 // operating constraints (workspace confinement, approval model). Any
 // instructions the workspace itself carries (AGENTS.md and friends) are
 // appended, so project rules come from the project rather than from here.
-func systemPrompt(workdir string, toolNames []string) string {
+//
+// jsonMode selects the output-format section: constrained JSON tool arrays
+// when true, and native tool_calls with ordinary assistant prose when false.
+func systemPrompt(workdir string, toolNames []string, jsonMode bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `You are drea, a minimalist autonomous coding agent operating in a Linux terminal.
 Your job is to complete the user's software task end to end by using the provided tools.
@@ -38,7 +41,32 @@ How to work:
 - Put the work under version control early: if the workspace is not a git repository yet, call git_init and commit a baseline, so every later change is reversible.
 - Use the git_* tools rather than running git through run_command: commit a checkpoint with git_commit before a risky change, inspect state with git_inspect, and if a change makes things worse use git_rollback to return to a known-good commit rather than trying to hand-undo it.
 
-Output format:
+`,
+		runtime.GOOS, runtime.GOARCH, time.Now().Format("2006-01-02"),
+		workdir, strings.Join(toolNames, ", "))
+	if jsonMode {
+		b.WriteString(jsonModeOutputRules(toolNames))
+	} else {
+		b.WriteString(nativeOutputRules())
+	}
+	b.WriteString(`Rules:
+- Use tools by emitting tool calls. Do not claim to have run a command or edited a file unless you actually called the tool.
+- When you have finished the task, stop issuing tool calls and give the user a short summary.
+- Be concise in your prose. Let the tools do the work.
+- run_command and file writes may require the user's approval; if an action is denied, adapt.
+- Before editing a file, read it first with read_file so your old_string matches the current content.
+- If a previous edit may have changed a file, re-read it before editing it again.
+- When editing, include enough surrounding context in old_string to make it unique.
+- For several changes to the same file, use apply_patch with multiple edits instead of many edit_file calls.
+- If edit_file fails with "old_string not found", re-read the file and try again with the exact current content.
+`)
+	b.WriteString(conventions.Prompt(conventions.Load(workdir)))
+	return b.String()
+}
+
+func jsonModeOutputRules(toolNames []string) string {
+	names := strings.Join(toolNames, ", ")
+	return fmt.Sprintf(`Output format:
 - You MUST output only valid JSON. No markdown, no code fences, no explanations, no other text.
 - Every response is a JSON array of one or more action objects. Each action has exactly two fields:
     "name": the action name — one of: %s
@@ -55,19 +83,14 @@ Examples of valid tool output:
 Example of a valid reply to the user:
   [{"name":"reply","arguments":{"message":"I'll start by reading the project files."}}]
 
-Rules:
-- Use tools by emitting tool calls. Do not claim to have run a command or edited a file unless you actually called the tool.
-- When you have finished the task, stop issuing tool calls and use a reply action to give the user a short summary.
-- Be concise in your prose. Let the tools do the work.
-- run_command and file writes may require the user's approval; if an action is denied, adapt.
-- Before editing a file, read it first with read_file so your old_string matches the current content.
-- If a previous edit may have changed a file, re-read it before editing it again.
-- When editing, include enough surrounding context in old_string to make it unique.
-- For several changes to the same file, use apply_patch with multiple edits instead of many edit_file calls.
-- If edit_file fails with "old_string not found", re-read the file and try again with the exact current content.
-`,
-		runtime.GOOS, runtime.GOARCH, time.Now().Format("2006-01-02"),
-		workdir, strings.Join(toolNames, ", "), strings.Join(toolNames, ", "))
-	b.WriteString(conventions.Prompt(conventions.Load(workdir)))
-	return b.String()
+`, names)
+}
+
+func nativeOutputRules() string {
+	return `Output format:
+- Call tools through the native tool-calling interface advertised by the endpoint.
+- Use ordinary assistant prose for greetings, questions, status updates, and the final summary. Do not wrap prose as JSON.
+- Do not claim to have run a command or edited a file unless you actually issued a tool call.
+
+`
 }

@@ -9,6 +9,7 @@
 package conventions
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -73,7 +74,7 @@ func Load(root string) []Doc {
 		if err != nil || !fi.Mode().IsRegular() {
 			continue
 		}
-		data, err := os.ReadFile(path)
+		f, err := os.Open(path)
 		if err != nil {
 			continue
 		}
@@ -81,7 +82,17 @@ func Load(root string) []Doc {
 		if budget < limit {
 			limit = budget
 		}
-		text, truncated := clip(string(data), limit)
+		data, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+		f.Close()
+		if err != nil {
+			continue
+		}
+		truncated := len(data) > limit
+		if truncated {
+			data = data[:limit]
+		}
+		text, clipTrunc := clip(string(data), limit)
+		truncated = truncated || clipTrunc
 		if strings.TrimSpace(text) == "" {
 			continue
 		}

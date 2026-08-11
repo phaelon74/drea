@@ -13,7 +13,7 @@ func TestSystemPromptIncludesProjectConventions(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte(rule), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	p := systemPrompt(root, []string{"read_file", "apply_patch"})
+	p := systemPrompt(root, []string{"read_file", "apply_patch"}, true)
 	if !strings.Contains(p, rule) {
 		t.Errorf("prompt does not carry the project rule:\n%s", p)
 	}
@@ -28,8 +28,28 @@ func TestSystemPromptIncludesProjectConventions(t *testing.T) {
 // A project with no instruction files must produce a prompt with no dangling
 // conventions section.
 func TestSystemPromptWithoutConventions(t *testing.T) {
-	p := systemPrompt(t.TempDir(), []string{"read_file"})
+	p := systemPrompt(t.TempDir(), []string{"read_file"}, true)
 	if strings.Contains(p, "Project instructions") {
 		t.Errorf("unexpected conventions section:\n%s", p)
+	}
+}
+
+func TestSystemPromptJSONModeRequiresJSONArray(t *testing.T) {
+	p := systemPrompt(t.TempDir(), []string{"read_file", "reply"}, true)
+	if !strings.Contains(p, "MUST output only valid JSON") {
+		t.Fatal("JSON-mode prompt missing JSON-only mandate")
+	}
+	if !strings.Contains(p, `"name":"reply"`) && !strings.Contains(p, "reply tool") {
+		t.Fatal("JSON-mode prompt missing reply pseudo-tool instructions")
+	}
+}
+
+func TestSystemPromptNoJSONModeOmitsJSONOnlyRules(t *testing.T) {
+	p := systemPrompt(t.TempDir(), []string{"read_file"}, false)
+	if strings.Contains(p, "MUST output only valid JSON") {
+		t.Fatalf("native-mode prompt still forces JSON:\n%s", p)
+	}
+	if !strings.Contains(p, "native tool-calling") {
+		t.Fatal("native-mode prompt missing native tool-call instructions")
 	}
 }
