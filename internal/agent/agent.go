@@ -483,7 +483,7 @@ func (a *Agent) prospectiveDiff(name string, args json.RawMessage) (text string,
 		return "", 0, 0, false
 	}
 	lines := diff.Lines(oldText, newText)
-	added, removed := diff.StatLines(lines)
+	added, removed = diff.StatLines(lines)
 	return diff.UnifiedLines(lines, 3), added, removed, true
 }
 
